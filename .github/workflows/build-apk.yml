@@ -36,13 +36,22 @@ jobs:
           test -f app/src/main/assets/www/splash.jpg
           cp web/app.js app/src/main/assets/www/app.js
           cp web/player-only.css app/src/main/assets/www/player-only.css
+          cp web/enhancements.js app/src/main/assets/www/enhancements.js
+          cp web/enhancements.css app/src/main/assets/www/enhancements.css
           python3 - <<'PY'
           from pathlib import Path
           p = Path('app/src/main/assets/www/index.html')
           s = p.read_text(encoding='utf-8')
-          link = '<link rel="stylesheet" href="player-only.css" />'
-          if link not in s:
-              s = s.replace('</head>', link + '\n</head>')
+          links = [
+              '<link rel="stylesheet" href="player-only.css" />',
+              '<link rel="stylesheet" href="enhancements.css" />',
+          ]
+          for link in links:
+              if link not in s:
+                  s = s.replace('</head>', link + '\n</head>')
+          script = '<script src="enhancements.js"></script>'
+          if script not in s:
+              s = s.replace('</body>', script + '\n</body>')
           p.write_text(s, encoding='utf-8')
           PY
           cp app/src/main/assets/www/icon.jpg app/src/main/res/drawable/icon.jpg
