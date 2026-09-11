@@ -1,0 +1,31 @@
+/* APK player-only shell: keep the original black/gold player design, remove the presentation website. */
+html, body { width:100%; height:100%; min-height:100%; overflow:hidden; }
+body { display:block; background:#07060A; }
+.site-header, .hero, .proto-grid > .sim, .rules-doc, .screens, .ident, .tech, footer, .site-footer { display:none !important; }
+main, .proto, .proto-grid, .phone-wrap { width:100%; height:100%; max-width:none; margin:0; padding:0; }
+.proto-grid { display:block; }
+.phone-wrap { position:static; }
+.phone { width:100%; max-width:none; height:100%; aspect-ratio:auto; margin:0; padding:0; border-radius:0; background:#07060A; box-shadow:none; }
+.phone-screen { height:100%; border-radius:0; padding-top:env(safe-area-inset-top); }
+.statusbar { display:none; }
+.appbar { padding-top:10px; }
+.navbar { padding-bottom:max(7px, env(safe-area-inset-bottom)); }
+.screen { padding-bottom:8px; }
+.screen[data-screen='library'], .screen[data-screen='playlists'], .screen[data-screen='queue'] { overflow-y:auto; scrollbar-width:none; }
+.permission-card { margin:10px 0 12px; padding:14px; border:1px solid var(--border-2); border-radius:var(--radius-lg); background:linear-gradient(180deg,rgba(240,201,84,.11),rgba(240,201,84,.03)); }
+.permission-card strong { display:block; color:#FFF6E2; margin-bottom:4px; }
+.permission-card span { display:block; color:var(--muted); font-size:12px; line-height:1.45; }
+.permission-card button { margin-top:10px; width:100%; border:1px solid var(--border-2); border-radius:999px; padding:9px 12px; background:var(--gold-grad); color:#171007; font-weight:800; }
+.native-note { margin:7px 0 0; color:var(--faint); font-size:10.5px; line-height:1.4; }
+.icon-btn.is-on { background:rgba(240,201,84,.16); color:var(--gold-hi); }
+.play-btn[disabled] { opacity:.42; }
+.scan code { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.out-list .out { cursor:default; }
+.out-list .out.is-on { border-color:var(--border-2); }
+.toast { position:absolute; left:50%; bottom:82px; transform:translate(-50%,8px); z-index:90; max-width:86%; padding:8px 12px; border-radius:999px; background:#19150c; border:1px solid var(--border-2); color:#FFF1C2; font-size:11px; opacity:0; pointer-events:none; transition:.22s ease; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.toast.is-on { opacity:1; transform:translate(-50%,0); }
+@media (min-width:700px) {
+  body { display:flex; justify-content:center; }
+  main, .proto, .proto-grid, .phone-wrap, .phone { max-width:430px; }
+  .phone { border-left:1px solid var(--border); border-right:1px solid var(--border); }
+}
