@@ -38,6 +38,7 @@ jobs:
           cp web/player-only.css app/src/main/assets/www/player-only.css
           cp web/enhancements.js app/src/main/assets/www/enhancements.js
           cp web/enhancements.css app/src/main/assets/www/enhancements.css
+          cp web/parallel-media.js app/src/main/assets/www/parallel-media.js
           python3 - <<'PY'
           from pathlib import Path
           p = Path('app/src/main/assets/www/index.html')
@@ -49,9 +50,13 @@ jobs:
           for link in links:
               if link not in s:
                   s = s.replace('</head>', link + '\n</head>')
-          script = '<script src="enhancements.js"></script>'
-          if script not in s:
-              s = s.replace('</body>', script + '\n</body>')
+          scripts = [
+              '<script src="enhancements.js"></script>',
+              '<script src="parallel-media.js"></script>',
+          ]
+          for script in scripts:
+              if script not in s:
+                  s = s.replace('</body>', script + '\n</body>')
           p.write_text(s, encoding='utf-8')
           PY
           cp app/src/main/assets/www/icon.jpg app/src/main/res/drawable/icon.jpg
