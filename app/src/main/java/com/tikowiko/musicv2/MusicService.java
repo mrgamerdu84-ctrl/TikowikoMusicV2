@@ -13,7 +13,11 @@ import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.MediaDescription;
+import android.media.MediaMetadata;
 import android.media.MediaPlayer;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.media.audiofx.BassBoost;
 import android.media.audiofx.LoudnessEnhancer;
 import android.media.audiofx.Virtualizer;
@@ -78,6 +82,7 @@ public class MusicService extends Service {
     }
 
     private MediaPlayer player;
+    private MediaSession mediaSession;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -86,9 +91,11 @@ public class MusicService extends Service {
     private int pendingStartPosition = 0;
     private boolean pendingAutoStart = true;
     private Runnable sleepRunnable;
+
     private final Runnable progressSaver = new Runnable() {
         @Override public void run() {
             persistSession();
+            updateMediaSession();
             handler.postDelayed(this, 5000L);
         }
     };
@@ -119,20 +126,24 @@ public class MusicService extends Service {
         instance = this;
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         createChannel();
+        createMediaSession();
+
         IntentFilter f = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(noisyReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(noisyReceiver, f);
+
         ExternalMediaMonitor.start(this);
         handler.post(progressSaver);
 
-        // Même mécanisme que la première TikowikoMusic : on restaure la session
-        // et on garde le service de lecture vivant hors de l'Activity.
+        // Même principe que la première TikowikoMusic : le service restaure la
+        // session et reste indépendant de l'écran / WebView.
         if (restoreSession()) {
             Track track = currentTrack();
             if (track != null) {
                 title = track.title;
                 artist = track.artist;
                 currentUri = track.uri;
+                refreshMediaQueue();
                 startForeground(NOTIF_ID, buildNotification(false));
                 prepareCurrent(pendingStartPosition, pendingAutoStart);
             }
@@ -142,6 +153,7 @@ public class MusicService extends Service {
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null || intent.getAction() == null) return START_STICKY;
         String a = intent.getAction();
+
         if (ACTION_PLAY_QUEUE.equals(a)) {
             loadQueue(intent.getStringExtra("queue"), intent.getIntExtra("index", 0));
             if (currentTrack() != null) {
@@ -152,10 +164,16 @@ public class MusicService extends Service {
             }
         } else if (ACTION_PLAY.equals(a)) {
             queue.clear();
-            queue.add(new Track(intent.getStringExtra("uri"), intent.getStringExtra("title"), intent.getStringExtra("artist"), "Musique"));
+            queue.add(new Track(
+                    intent.getStringExtra("uri"),
+                    intent.getStringExtra("title"),
+                    intent.getStringExtra("artist"),
+                    "Musique"
+            ));
             queueIndex = 0;
             explicitStopRequested = false;
             sessionWantsPlayback = true;
+            refreshMediaQueue();
             startForeground(NOTIF_ID, buildNotification(false));
             prepareCurrent(0, true);
         } else if (ACTION_PAUSE.equals(a)) pause(false);
@@ -169,10 +187,102 @@ public class MusicService extends Service {
         else if (ACTION_FOCUS.equals(a)) setFocusMode(intent.getStringExtra("mode"));
         else if (ACTION_MODE.equals(a)) setAudioMode(intent.getStringExtra("mode"));
         else if (ACTION_NOISY.equals(a)) pauseOnUnplug = Boolean.parseBoolean(intent.getStringExtra("enabled"));
-        else if (ACTION_NORMALIZE.equals(a)) { normalize = Boolean.parseBoolean(intent.getStringExtra("enabled")); applyEffects(); }
-        else if (ACTION_SLEEP.equals(a)) setSleep(intent.getStringExtra("value"));
+        else if (ACTION_NORMALIZE.equals(a)) {
+            normalize = Boolean.parseBoolean(intent.getStringExtra("enabled"));
+            applyEffects();
+        } else if (ACTION_SLEEP.equals(a)) setSleep(intent.getStringExtra("value"));
+
         persistSession();
+        updateMediaSession();
         return START_STICKY;
+    }
+
+    private void createMediaSession() {
+        mediaSession = new MediaSession(this, "TikowikoMusicV2");
+        mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
+        mediaSession.setSessionActivity(openAppPendingIntent(false));
+        mediaSession.setCallback(new MediaSession.Callback() {
+            @Override public void onPlay() { resume(); }
+            @Override public void onPause() { pause(false); }
+            @Override public void onSkipToNext() { playNextInternal(false); }
+            @Override public void onSkipToPrevious() { playPreviousInternal(); }
+            @Override public void onSeekTo(long pos) { seek((int)Math.max(0L, Math.min(Integer.MAX_VALUE, pos))); }
+            @Override public void onStop() { stopPlayback(); }
+            @Override public void onSkipToQueueItem(long id) {
+                int index = (int) id;
+                if (index < 0 || index >= queue.size()) return;
+                queueIndex = index;
+                sessionWantsPlayback = true;
+                explicitStopRequested = false;
+                prepareCurrent(0, true);
+            }
+        }, handler);
+        mediaSession.setActive(true);
+        updateMediaSession();
+    }
+
+    private void refreshMediaQueue() {
+        if (mediaSession == null) return;
+        List<MediaSession.QueueItem> items = new ArrayList<>();
+        for (int i = 0; i < queue.size(); i++) {
+            Track t = queue.get(i);
+            MediaDescription description = new MediaDescription.Builder()
+                    .setMediaId(String.valueOf(i))
+                    .setTitle(t.title)
+                    .setSubtitle(t.artist)
+                    .setDescription(t.folder)
+                    .setMediaUri(Uri.parse(t.uri))
+                    .build();
+            items.add(new MediaSession.QueueItem(description, i));
+        }
+        try {
+            mediaSession.setQueue(items);
+            Track current = currentTrack();
+            mediaSession.setQueueTitle(current == null ? "TikowikoMusic" : "Dossier " + current.folder);
+        } catch (Exception ignored) {}
+        updateMediaSession();
+    }
+
+    private void updateMediaSession() {
+        if (mediaSession == null) return;
+        Track t = currentTrack();
+        int duration = 0;
+        int position = pendingStartPosition;
+        boolean playing = false;
+        try {
+            if (player != null && prepared) {
+                duration = Math.max(0, player.getDuration());
+                position = Math.max(0, player.getCurrentPosition());
+                playing = player.isPlaying();
+            }
+        } catch (Exception ignored) {}
+
+        if (t != null) {
+            MediaMetadata metadata = new MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, t.title)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, t.artist)
+                    .putString(MediaMetadata.METADATA_KEY_ALBUM, t.folder)
+                    .putLong(MediaMetadata.METADATA_KEY_DURATION, duration)
+                    .build();
+            mediaSession.setMetadata(metadata);
+        }
+
+        long actions = PlaybackState.ACTION_PLAY |
+                PlaybackState.ACTION_PAUSE |
+                PlaybackState.ACTION_PLAY_PAUSE |
+                PlaybackState.ACTION_SKIP_TO_NEXT |
+                PlaybackState.ACTION_SKIP_TO_PREVIOUS |
+                PlaybackState.ACTION_SEEK_TO |
+                PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM |
+                PlaybackState.ACTION_STOP;
+
+        int state = t == null ? PlaybackState.STATE_STOPPED :
+                (playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED);
+        PlaybackState.Builder b = new PlaybackState.Builder()
+                .setActions(actions)
+                .setState(state, position, playing ? 1f : 0f);
+        try { b.setActiveQueueItemId(queueIndex); } catch (Exception ignored) {}
+        mediaSession.setPlaybackState(b.build());
     }
 
     private void loadQueue(String json, int requestedIndex) {
@@ -184,10 +294,16 @@ public class MusicService extends Service {
                 if (o == null) continue;
                 String uri = o.optString("uri", "");
                 if (uri.isEmpty()) continue;
-                queue.add(new Track(uri, o.optString("title", "Sans titre"), o.optString("artist", "Artiste inconnu"), o.optString("folder", "Musique")));
+                queue.add(new Track(
+                        uri,
+                        o.optString("title", "Sans titre"),
+                        o.optString("artist", "Artiste inconnu"),
+                        o.optString("folder", "Musique")
+                ));
             }
         } catch (Exception ignored) {}
         queueIndex = queue.isEmpty() ? -1 : Math.max(0, Math.min(requestedIndex, queue.size() - 1));
+        refreshMediaQueue();
     }
 
     private Track currentTrack() {
@@ -207,11 +323,15 @@ public class MusicService extends Service {
         pausedByFocus = false;
         pausedByExternalMedia = false;
         ducked = false;
+
         releasePlayerOnly();
         player = new MediaPlayer();
         prepared = false;
         try {
-            player.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build());
+            player.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build());
             player.setWakeMode(this, PowerManager.PARTIAL_WAKE_LOCK);
             player.setDataSource(this, Uri.parse(track.uri));
             player.setOnPreparedListener(mp -> {
@@ -219,19 +339,20 @@ public class MusicService extends Service {
                 if (pendingStartPosition > 0) {
                     try { mp.seekTo(pendingStartPosition); } catch (Exception ignored) {}
                 }
+                applyEffects();
+                applyVolume();
                 if (pendingAutoStart && sessionWantsPlayback) {
                     requestFocus();
-                    applyEffects();
-                    applyVolume();
                     try { mp.start(); } catch (Exception ignored) {}
-                } else {
-                    applyEffects();
-                    applyVolume();
                 }
                 updateNotification();
                 persistSession();
                 dispatchTrackChanged();
-                MainActivity.dispatchToWeb("window.onNativePlaybackStarted && window.onNativePlaybackStarted();");
+                if (mp.isPlaying()) {
+                    MainActivity.dispatchToWeb("window.onNativePlaybackStarted && window.onNativePlaybackStarted();");
+                } else {
+                    MainActivity.dispatchToWeb("window.onNativePlaybackPaused && window.onNativePlaybackPaused();");
+                }
             });
             player.setOnCompletionListener(mp -> handler.post(() -> {
                 if (stopAtEnd) {
@@ -255,11 +376,15 @@ public class MusicService extends Service {
             player.setOnErrorListener((mp, what, extra) -> {
                 MainActivity.dispatchToWeb("window.onNativePlaybackError && window.onNativePlaybackError();");
                 if (sessionWantsPlayback && queueIndex + 1 < queue.size()) {
-                    handler.post(() -> { queueIndex++; prepareCurrent(0, true); });
+                    handler.post(() -> {
+                        queueIndex++;
+                        prepareCurrent(0, true);
+                    });
                 }
                 return true;
             });
             player.prepareAsync();
+            updateMediaSession();
         } catch (Exception e) {
             MainActivity.dispatchToWeb("window.onNativePlaybackError && window.onNativePlaybackError();");
         }
@@ -268,7 +393,9 @@ public class MusicService extends Service {
     private void dispatchTrackChanged() {
         MainActivity.dispatchToWeb(
                 "window.onNativeTrackChanged && window.onNativeTrackChanged(" +
-                        JSONObject.quote(currentUri) + "," + JSONObject.quote(title) + "," + JSONObject.quote(artist) + ");"
+                        JSONObject.quote(currentUri) + "," +
+                        JSONObject.quote(title) + "," +
+                        JSONObject.quote(artist) + ");"
         );
     }
 
@@ -294,6 +421,7 @@ public class MusicService extends Service {
         try {
             if (currentTrack() == null) return;
             sessionWantsPlayback = true;
+            explicitStopRequested = false;
             if (player == null || !prepared) {
                 startForeground(NOTIF_ID, buildNotification(false));
                 prepareCurrent(pendingStartPosition, true);
@@ -316,12 +444,13 @@ public class MusicService extends Service {
     private void playNextInternal(boolean fromCompletion) {
         if (queue.isEmpty()) return;
         if (queueIndex + 1 >= queue.size()) {
-            if (!fromCompletion) queueIndex = 0;
-            else return;
+            if (fromCompletion) return;
+            queueIndex = 0;
         } else {
             queueIndex++;
         }
         sessionWantsPlayback = true;
+        explicitStopRequested = false;
         startForeground(NOTIF_ID, buildNotification(false));
         prepareCurrent(0, true);
     }
@@ -336,6 +465,7 @@ public class MusicService extends Service {
         } catch (Exception ignored) {}
         queueIndex = queueIndex <= 0 ? queue.size() - 1 : queueIndex - 1;
         sessionWantsPlayback = true;
+        explicitStopRequested = false;
         startForeground(NOTIF_ID, buildNotification(false));
         prepareCurrent(0, true);
     }
@@ -347,7 +477,6 @@ public class MusicService extends Service {
                 player.pause();
                 pausedByExternalMedia = true;
                 pausedByFocus = false;
-                // On garde sessionWantsPlayback=true pour reprendre ensuite.
                 updateNotification();
                 persistSession();
                 MainActivity.dispatchToWeb("window.onNativePlaybackPaused && window.onNativePlaybackPaused();");
@@ -386,6 +515,8 @@ public class MusicService extends Service {
         releasePlayerOnly();
         abandonFocus();
         clearSession();
+        refreshMediaQueue();
+        updateMediaSession();
         stopForeground(true);
         stopSelf();
     }
@@ -395,6 +526,7 @@ public class MusicService extends Service {
             pendingStartPosition = Math.max(0, ms);
             if (player != null && prepared) player.seekTo(pendingStartPosition);
             persistSession();
+            updateMediaSession();
         } catch (Exception ignored) {}
     }
 
@@ -420,8 +552,12 @@ public class MusicService extends Service {
         sleepRunnable = null;
         stopAtEnd = false;
         if (value == null || "off".equals(value)) return;
-        if ("end".equals(value)) { stopAtEnd = true; return; }
-        long delay = "15".equals(value) ? 15L * 60_000L : "30".equals(value) ? 30L * 60_000L : 0;
+        if ("end".equals(value)) {
+            stopAtEnd = true;
+            return;
+        }
+        long delay = "15".equals(value) ? 15L * 60_000L :
+                ("30".equals(value) ? 30L * 60_000L : 0L);
         if (delay > 0) {
             sleepRunnable = () -> pause(false);
             handler.postDelayed(sleepRunnable, delay);
@@ -431,7 +567,10 @@ public class MusicService extends Service {
     private void requestFocus() {
         try {
             if (Build.VERSION.SDK_INT >= 26) {
-                AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build();
+                AudioAttributes attrs = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build();
                 focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                         .setAudioAttributes(attrs)
                         .setAcceptsDelayedFocusGain(false)
@@ -440,42 +579,63 @@ public class MusicService extends Service {
                         .build();
                 audioManager.requestAudioFocus(focusRequest);
             } else {
-                audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+                audioManager.requestAudioFocus(
+                        focusListener,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN
+                );
             }
         } catch (Exception ignored) {}
     }
 
     private void abandonFocus() {
         try {
-            if (Build.VERSION.SDK_INT >= 26 && focusRequest != null) audioManager.abandonAudioFocusRequest(focusRequest);
-            else audioManager.abandonAudioFocus(focusListener);
+            if (Build.VERSION.SDK_INT >= 26 && focusRequest != null) {
+                audioManager.abandonAudioFocusRequest(focusRequest);
+            } else {
+                audioManager.abandonAudioFocus(focusListener);
+            }
         } catch (Exception ignored) {}
     }
 
     private final AudioManager.OnAudioFocusChangeListener focusListener = change -> {
         if (change == AudioManager.AUDIOFOCUS_GAIN) {
-            if (ducked) { ducked = false; applyVolume(); }
+            if (ducked) {
+                ducked = false;
+                applyVolume();
+            }
             if (pausedByFocus && !pausedByExternalMedia && sessionWantsPlayback) resume();
             else pausedByFocus = false;
             return;
         }
+
         if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
-            if ("duck".equals(focusMode)) { ducked = true; applyVolume(); }
-            else { ducked = false; applyVolume(); }
+            if ("duck".equals(focusMode)) {
+                ducked = true;
+                applyVolume();
+            } else {
+                ducked = false;
+                applyVolume();
+            }
             return;
         }
+
         if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
             pause(true);
             return;
         }
+
         if (change == AudioManager.AUDIOFOCUS_LOSS) {
             pausedByFocus = false;
-            if ("duck".equals(focusMode)) { ducked = true; applyVolume(); }
-            else {
+            if ("duck".equals(focusMode)) {
+                ducked = true;
+                applyVolume();
+            } else {
                 ducked = false;
                 applyVolume();
                 try {
-                    if ("keep".equals(focusMode) && player != null && prepared && !pausedByExternalMedia && sessionWantsPlayback && !player.isPlaying()) {
+                    if ("keep".equals(focusMode) && player != null && prepared &&
+                            !pausedByExternalMedia && sessionWantsPlayback && !player.isPlaying()) {
                         player.start();
                         updateNotification();
                     }
@@ -496,7 +656,9 @@ public class MusicService extends Service {
         try { if (bassBoost != null) bassBoost.release(); } catch (Exception ignored) {}
         try { if (virtualizer != null) virtualizer.release(); } catch (Exception ignored) {}
         try { if (loudnessEnhancer != null) loudnessEnhancer.release(); } catch (Exception ignored) {}
-        bassBoost = null; virtualizer = null; loudnessEnhancer = null;
+        bassBoost = null;
+        virtualizer = null;
+        loudnessEnhancer = null;
     }
 
     private void applyEffects() {
@@ -513,11 +675,11 @@ public class MusicService extends Service {
         try {
             if ("bass".equals(audioMode)) {
                 bassBoost = new BassBoost(0, session);
-                if (bassBoost.getStrengthSupported()) bassBoost.setStrength((short) 800);
+                if (bassBoost.getStrengthSupported()) bassBoost.setStrength((short)800);
                 bassBoost.setEnabled(true);
             } else if ("stage".equals(audioMode)) {
                 virtualizer = new Virtualizer(0, session);
-                if (virtualizer.getStrengthSupported()) virtualizer.setStrength((short) 700);
+                if (virtualizer.getStrengthSupported()) virtualizer.setStrength((short)700);
                 virtualizer.setEnabled(true);
             }
         } catch (Exception ignored) {}
@@ -549,7 +711,9 @@ public class MusicService extends Service {
     private void persistSession() {
         if (explicitStopRequested || queue.isEmpty() || queueIndex < 0) return;
         int position = pendingStartPosition;
-        try { if (player != null && prepared) position = player.getCurrentPosition(); } catch (Exception ignored) {}
+        try {
+            if (player != null && prepared) position = player.getCurrentPosition();
+        } catch (Exception ignored) {}
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putBoolean("active", true)
                 .putString("queue", queueJson().toString())
@@ -578,64 +742,112 @@ public class MusicService extends Service {
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationManager nm = getSystemService(NotificationManager.class);
-            NotificationChannel c = new NotificationChannel(CHANNEL, "Lecture musicale", NotificationManager.IMPORTANCE_LOW);
-            c.setDescription("Lecture audio en arrière-plan");
+            NotificationChannel c = new NotificationChannel(
+                    CHANNEL,
+                    "Lecture musicale",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            c.setDescription("Lecteur TikowikoMusic en arrière-plan");
             c.setShowBadge(false);
+            c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
             nm.createNotificationChannel(c);
         }
     }
 
     private PendingIntent servicePendingIntent(String action, int requestCode) {
         Intent i = new Intent(this, MusicService.class).setAction(action);
-        return PendingIntent.getService(this, requestCode, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        return PendingIntent.getService(
+                this,
+                requestCode,
+                i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+    }
+
+    private PendingIntent openAppPendingIntent(boolean library) {
+        Intent open = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        if (library) open.putExtra("openLibrary", true);
+        return PendingIntent.getActivity(
+                this,
+                library ? 101 : 100,
+                open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
     }
 
     private Notification buildNotification(boolean playing) {
-        Intent open = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
         int playIcon = playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play;
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL)
+                : new Notification.Builder(this);
+
+        Notification.MediaStyle style = new Notification.MediaStyle()
+                .setShowActionsInCompactView(0, 1, 2);
+        if (mediaSession != null) style.setMediaSession(mediaSession.getSessionToken());
+
+        Track current = currentTrack();
         return b.setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle(title)
                 .setContentText(artist.isEmpty() ? "tikoWiko Musique" : artist)
-                .setSubText(currentTrack() == null ? null : currentTrack().folder)
-                .setContentIntent(pi)
+                .setSubText(current == null ? null : current.folder)
+                .setContentIntent(openAppPendingIntent(false))
                 .setOnlyAlertOnce(true)
                 .setShowWhen(false)
-                .setOngoing(currentTrack() != null)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setOngoing(current != null)
                 .setCategory(Notification.CATEGORY_TRANSPORT)
                 .addAction(android.R.drawable.ic_media_previous, "Précédent", servicePendingIntent(ACTION_PREVIOUS, 1))
                 .addAction(playIcon, playing ? "Pause" : "Lecture", servicePendingIntent(ACTION_TOGGLE, 2))
                 .addAction(android.R.drawable.ic_media_next, "Suivant", servicePendingIntent(ACTION_NEXT, 3))
+                .addAction(android.R.drawable.ic_menu_agenda, "Choisir une musique", openAppPendingIntent(true))
+                .setStyle(style)
                 .build();
     }
 
     private void updateNotification() {
         try {
             boolean playing = player != null && prepared && player.isPlaying();
-            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            nm.notify(NOTIF_ID, buildNotification(playing));
+            updateMediaSession();
+            Notification n = buildNotification(playing);
+            if (currentTrack() != null) {
+                startForeground(NOTIF_ID, n);
+            } else {
+                NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                nm.notify(NOTIF_ID, n);
+            }
         } catch (Exception ignored) {}
     }
 
     @Override public void onTaskRemoved(Intent rootIntent) {
-        // Ne surtout pas arrêter la lecture quand l'utilisateur enlève l'app des récents.
         persistSession();
         if (currentTrack() != null) {
-            try { startForeground(NOTIF_ID, buildNotification(player != null && prepared && player.isPlaying())); } catch (Exception ignored) {}
+            try {
+                startForeground(
+                        NOTIF_ID,
+                        buildNotification(player != null && prepared && player.isPlaying())
+                );
+            } catch (Exception ignored) {}
         }
         super.onTaskRemoved(rootIntent);
     }
 
     private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            if (pauseOnUnplug && AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) pause(false);
+            if (pauseOnUnplug && AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
+                pause(false);
+            }
         }
     };
 
     private void releasePlayerOnly() {
         releaseEffects();
-        try { if (player != null) { player.reset(); player.release(); } } catch (Exception ignored) {}
+        try {
+            if (player != null) {
+                player.reset();
+                player.release();
+            }
+        } catch (Exception ignored) {}
         player = null;
         prepared = false;
     }
@@ -648,6 +860,13 @@ public class MusicService extends Service {
         ExternalMediaMonitor.stop();
         releasePlayerOnly();
         abandonFocus();
+        if (mediaSession != null) {
+            try {
+                mediaSession.setActive(false);
+                mediaSession.release();
+            } catch (Exception ignored) {}
+            mediaSession = null;
+        }
         if (instance == this) instance = null;
         super.onDestroy();
     }
