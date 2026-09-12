@@ -9,6 +9,22 @@
     return document.querySelector('#tikobotReply');
   }
 
+  function speak(text) {
+    try {
+      if (window.Android && typeof window.Android.speakTikoBot === 'function') {
+        window.Android.speakTikoBot(String(text || ''));
+      }
+    } catch (_) {}
+  }
+
+  function stopVoice() {
+    try {
+      if (window.Android && typeof window.Android.stopTikoBotVoice === 'function') {
+        window.Android.stopTikoBotVoice();
+      }
+    } catch (_) {}
+  }
+
   function cancelGreeting() {
     if (greetingTimer) clearTimeout(greetingTimer);
     if (fadeTimer) clearTimeout(fadeTimer);
@@ -25,8 +41,8 @@
     const hour = new Date().getHours();
     const evening = hour >= 18 || hour < 5;
     return evening
-      ? { hello: 'Bonsoir 🌙', question: 'Qu’est-ce que tu veux écouter maintenant ?' }
-      : { hello: 'Salut 👋', question: 'Qu’est-ce que tu veux écouter aujourd’hui ?' };
+      ? { hello: 'Bonsoir', question: 'Qu’est-ce que tu veux écouter maintenant ?' }
+      : { hello: 'Salut', question: 'Qu’est-ce que tu veux écouter aujourd’hui ?' };
   }
 
   function showGreeting() {
@@ -38,7 +54,8 @@
     el.style.transition = 'opacity .22s ease, transform .22s ease';
     el.style.opacity = '1';
     el.style.transform = 'translateY(0)';
-    el.textContent = message.hello;
+    el.textContent = message.hello + (message.hello === 'Bonsoir' ? ' 🌙' : ' 👋');
+    speak(message.hello);
 
     greetingTimer = setTimeout(() => {
       el.style.opacity = '0';
@@ -49,6 +66,7 @@
         requestAnimationFrame(() => {
           el.style.opacity = '1';
           el.style.transform = 'translateY(0)';
+          speak(message.question);
         });
       }, 230);
     }, 1500);
@@ -63,6 +81,7 @@
 
       if (event.target.closest('#tikobotGo, #tikobotMic, #tikobotClose, .tikobot-result')) {
         cancelGreeting();
+        if (event.target.closest('#tikobotClose')) stopVoice();
       }
     });
 
