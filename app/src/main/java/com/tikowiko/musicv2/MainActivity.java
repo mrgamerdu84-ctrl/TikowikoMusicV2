@@ -28,30 +28,72 @@ import org.json.JSONObject;
 import java.io.File;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 public class MainActivity extends Activity {
     private static final int REQ_AUDIO = 501;
     private static final int REQ_VOICE = 502;
+    private static final int REQ_NOTIFICATIONS = 503;
     private static WeakReference<MainActivity> current = new WeakReference<>(null);
+
     private WebView webView;
+    private boolean pendingOpenLibrary = false;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         current = new WeakReference<>(this);
+        pendingOpenLibrary = getIntent() != null && getIntent().getBooleanExtra("openLibrary", false);
+
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        );
+
         webView = new WebView(this);
         setContentView(webView);
         WebSettings s = webView.getSettings();
-        s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true);
-        s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false);
-        s.setLoadsImagesAutomatically(true); s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        webView.setWebViewClient(new WebViewClient());
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setDatabaseEnabled(true);
+        s.setAllowFileAccess(true);
+        s.setAllowContentAccess(true);
+        s.setMediaPlaybackRequiresUserGesture(false);
+        s.setLoadsImagesAutomatically(true);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        webView.setWebViewClient(new WebViewClient() {
+            @Override public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                openLibraryIfRequested();
+            }
+        });
         webView.setWebChromeClient(new WebChromeClient());
         webView.addJavascriptInterface(new AndroidBridge(), "Android");
         webView.loadUrl("file:///android_asset/www/index.html");
+
+        requestNotificationPermissionIfNeeded();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent != null && intent.getBooleanExtra("openLibrary", false)) {
+            pendingOpenLibrary = true;
+            openLibraryIfRequested();
+        }
+    }
+
+    private void openLibraryIfRequested() {
+        if (!pendingOpenLibrary || webView == null) return;
+        pendingOpenLibrary = false;
+        webView.postDelayed(() -> webView.evaluateJavascript(
+                "(function(){var b=document.querySelector('[data-go=\"library\"]');if(b)b.click();})();",
+                null
+        ), 180L);
     }
 
     public static void dispatchToWeb(final String javascript) {
@@ -61,13 +103,25 @@ public class MainActivity extends Activity {
     }
 
     private boolean hasAudioPermissionInternal() {
-        if (Build.VERSION.SDK_INT >= 33) return checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (Build.VERSION.SDK_INT >= 33) {
+            return checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        }
         return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestAudioPermissionInternal() {
-        if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{Manifest.permission.READ_MEDIA_AUDIO}, REQ_AUDIO);
-        else requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQ_AUDIO);
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(new String[]{Manifest.permission.READ_MEDIA_AUDIO}, REQ_AUDIO);
+        } else {
+            requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQ_AUDIO);
+        }
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATIONS);
+        }
     }
 
     private void startVoiceSearchInternal() {
@@ -115,22 +169,45 @@ public class MainActivity extends Activity {
             return value.isEmpty() ? fallback : value;
         }
         File parent = new File(rawPath).getParentFile();
-        if (parent == null || parent.getName() == null || parent.getName().trim().isEmpty()) return fallback;
-        return parent.getName().trim();
+        if (parent == null) return fallback;
+        String absolute = parent.getAbsolutePath().replace('\\', '/');
+        String storage = "/storage/emulated/0/";
+        if (absolute.startsWith(storage)) absolute = absolute.substring(storage.length());
+        while (absolute.startsWith("/")) absolute = absolute.substring(1);
+        return absolute.trim().isEmpty() ? fallback : absolute;
     }
 
+    /**
+     * Bibliothèque basée sur le vrai chemin Android, comme la première TikowikoMusic.
+     * Les morceaux sont triés dossier physique -> titre et les doublons MediaStore
+     * pointant sur le même fichier physique sont supprimés.
+     */
     private String getSongsJson() {
         JSONArray out = new JSONArray();
         if (!hasAudioPermissionInternal()) return out.toString();
+
         Uri collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
-        String folderColumnName = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ? MediaStore.Audio.Media.RELATIVE_PATH : MediaStore.Audio.Media.DATA;
+        String folderColumnName = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                ? MediaStore.Audio.Media.RELATIVE_PATH
+                : MediaStore.Audio.Media.DATA;
+
         String[] projection = new String[]{
-                MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST,
-                MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.MIME_TYPE,
+                MediaStore.Audio.Media._ID,
+                MediaStore.Audio.Media.TITLE,
+                MediaStore.Audio.Media.ARTIST,
+                MediaStore.Audio.Media.ALBUM,
+                MediaStore.Audio.Media.DURATION,
+                MediaStore.Audio.Media.MIME_TYPE,
+                MediaStore.Audio.Media.DISPLAY_NAME,
                 folderColumnName
         };
+
         String selection = MediaStore.Audio.Media.IS_MUSIC + " != 0";
-        String sort = MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC";
+        String sort = folderColumnName + " COLLATE NOCASE ASC, " +
+                MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC, " +
+                MediaStore.Audio.Media._ID + " ASC";
+
+        Set<String> seenPhysicalFiles = new HashSet<>();
         try (Cursor c = getContentResolver().query(collection, projection, selection, null, sort)) {
             if (c == null) return out.toString();
             int idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
@@ -139,20 +216,34 @@ public class MainActivity extends Activity {
             int albumCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM);
             int durationCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION);
             int mimeCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE);
+            int displayCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME);
             int folderCol = c.getColumnIndexOrThrow(folderColumnName);
+
             while (c.moveToNext()) {
                 long id = c.getLong(idCol);
                 long duration = Math.max(0L, c.getLong(durationCol));
-                String title = c.getString(titleCol), artist = c.getString(artistCol), album = c.getString(albumCol), mime = c.getString(mimeCol);
+                String title = c.getString(titleCol);
+                String artist = c.getString(artistCol);
+                String album = c.getString(albumCol);
+                String mime = c.getString(mimeCol);
+                String displayName = c.getString(displayCol);
                 String folder = normalizeFolder(c.getString(folderCol));
+
+                String physicalKey = (folder + "\u0000" +
+                        (displayName == null || displayName.trim().isEmpty() ? String.valueOf(id) : displayName))
+                        .toLowerCase(Locale.ROOT);
+                if (!seenPhysicalFiles.add(physicalKey)) continue;
+
                 JSONObject o = new JSONObject();
                 o.put("id", id);
                 o.put("title", title == null || title.trim().isEmpty() ? "Sans titre" : title.trim());
-                o.put("artist", artist == null || artist.trim().isEmpty() || "<unknown>".equals(artist) ? "Artiste inconnu" : artist.trim());
+                o.put("artist", artist == null || artist.trim().isEmpty() || "<unknown>".equals(artist)
+                        ? "Artiste inconnu" : artist.trim());
                 o.put("album", album == null || album.trim().isEmpty() ? "Album inconnu" : album.trim());
                 o.put("duration", duration);
                 o.put("mime", mime == null ? "audio" : mime);
                 o.put("folder", folder);
+                o.put("fileName", displayName == null ? "" : displayName);
                 o.put("uri", ContentUris.withAppendedId(collection, id).toString());
                 out.put(o);
             }
@@ -160,12 +251,6 @@ public class MainActivity extends Activity {
         return out.toString();
     }
 
-    /**
-     * Même principe que la première TikowikoMusic : la file native est construite
-     * avec les morceaux qui ont exactement le même chemin physique Android.
-     * Elle vit ensuite dans le service, donc elle continue même si la WebView
-     * ou l'activité n'est plus au premier plan.
-     */
     private JSONObject buildPhysicalFolderQueue(String selectedUri, String fallbackTitle, String fallbackArtist) {
         JSONObject payload = new JSONObject();
         JSONArray queue = new JSONArray();
@@ -203,7 +288,6 @@ public class MainActivity extends Activity {
                 q.put("artist", fallbackArtist == null ? "Artiste inconnu" : fallbackArtist);
                 q.put("folder", "Musique");
                 queue.put(q);
-                selectedIndex = 0;
             } catch (Exception ignored) {}
         }
         try {
@@ -247,8 +331,13 @@ public class MainActivity extends Activity {
         else startService(intent);
     }
 
-    private void command(String action) { startService(new Intent(this, MusicService.class).setAction(action)); }
-    private void command(String action, String key, String value) { startService(new Intent(this, MusicService.class).setAction(action).putExtra(key, value)); }
+    private void command(String action) {
+        startService(new Intent(this, MusicService.class).setAction(action));
+    }
+
+    private void command(String action, String key, String value) {
+        startService(new Intent(this, MusicService.class).setAction(action).putExtra(key, value));
+    }
 
     public class AndroidBridge {
         @JavascriptInterface public boolean hasAudioPermission() { return hasAudioPermissionInternal(); }
@@ -260,10 +349,10 @@ public class MainActivity extends Activity {
         @JavascriptInterface public void play(String uri, String title, String artist) {
             if (uri == null || uri.trim().isEmpty()) return;
             JSONObject payload = buildPhysicalFolderQueue(uri, title, artist);
-            JSONArray queue = payload.optJSONArray("queue");
+            JSONArray q = payload.optJSONArray("queue");
             Intent i = new Intent(MainActivity.this, MusicService.class)
                     .setAction(MusicService.ACTION_PLAY_QUEUE)
-                    .putExtra("queue", queue == null ? "[]" : queue.toString())
+                    .putExtra("queue", q == null ? "[]" : q.toString())
                     .putExtra("index", payload.optInt("index", 0));
             startPlaybackService(i);
         }
@@ -281,8 +370,14 @@ public class MainActivity extends Activity {
         @JavascriptInterface public void stop() { command(MusicService.ACTION_STOP); }
         @JavascriptInterface public void next() { command(MusicService.ACTION_NEXT); }
         @JavascriptInterface public void previous() { command(MusicService.ACTION_PREVIOUS); }
-        @JavascriptInterface public void seekTo(int ms) { startService(new Intent(MainActivity.this, MusicService.class).setAction(MusicService.ACTION_SEEK).putExtra("ms", ms)); }
-        @JavascriptInterface public void setVolume(int percent) { startService(new Intent(MainActivity.this, MusicService.class).setAction(MusicService.ACTION_VOLUME).putExtra("percent", percent)); }
+        @JavascriptInterface public void seekTo(int ms) {
+            startService(new Intent(MainActivity.this, MusicService.class)
+                    .setAction(MusicService.ACTION_SEEK).putExtra("ms", ms));
+        }
+        @JavascriptInterface public void setVolume(int percent) {
+            startService(new Intent(MainActivity.this, MusicService.class)
+                    .setAction(MusicService.ACTION_VOLUME).putExtra("percent", percent));
+        }
         @JavascriptInterface public void setFocusMode(String mode) { command(MusicService.ACTION_FOCUS, "mode", mode); }
         @JavascriptInterface public void setAudioMode(String mode) { command(MusicService.ACTION_MODE, "mode", mode); }
         @JavascriptInterface public void setPauseOnUnplug(boolean enabled) { command(MusicService.ACTION_NOISY, "enabled", String.valueOf(enabled)); }
