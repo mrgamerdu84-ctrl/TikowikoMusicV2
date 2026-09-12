@@ -1,30 +1,22 @@
-/* tikoWiko Musique — lecture strictement par dossier physique, sans changer le design */
+/* TikowikoMusicV2 — dossiers physiques stricts + synchro du lecteur natif */
 (() => {
   'use strict';
 
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const A = window.Android || null;
-
   let songs = [];
   let activeFolder = '';
-  let folderIndices = [];
-  let currentFolderPos = -1;
-  let lastFolder = null;
-  let syncing = false;
-  let originalEnded = null;
+  let scheduled = false;
 
-  function safeCall(name, ...args) {
+  const safeCall = (name, ...args) => {
     try { return A && typeof A[name] === 'function' ? A[name](...args) : null; }
     catch (_) { return null; }
-  }
+  };
 
-  function folderKey(raw) {
-    return String(raw || 'Musique')
-      .replace(/\\/g, '/')
-      .replace(/\/+$/g, '')
-      .replace(/^\/+/, '') || 'Musique';
-  }
+  const folderKey = raw => String(raw || 'Musique')
+    .replace(/\\/g, '/')
+    .replace(/^\/+|\/+$/g, '') || 'Musique';
 
   function readSongs() {
     if (!A || !safeCall('hasAudioPermission')) {
@@ -33,259 +25,165 @@
     }
     try { songs = JSON.parse(safeCall('getSongs') || '[]'); }
     catch (_) { songs = []; }
-    songs.forEach(s => { s.folder = folderKey(s.folder); });
-  }
-
-  function physicalFolders() {
-    return [...new Set(songs.map(s => folderKey(s.folder)))].sort((a, b) => a.localeCompare(b, 'fr'));
-  }
-
-  function resolveCurrentPos() {
-    if (!folderIndices.length) {
-      currentFolderPos = -1;
-      return;
-    }
-    try {
-      const state = JSON.parse(safeCall('getPlaybackState') || '{}');
-      const title = String(state.title || '');
-      const artist = String(state.artist || '');
-      const found = folderIndices.findIndex(i => {
-        const s = songs[i];
-        return s && String(s.title || '') === title && String(s.artist || '') === artist;
-      });
-      if (found >= 0) currentFolderPos = found;
-    } catch (_) {}
-    if (currentFolderPos < 0 || currentFolderPos >= folderIndices.length) currentFolderPos = 0;
-  }
-
-  function rebuildFolder() {
-    readSongs();
-    const folders = physicalFolders();
+    songs.forEach((s, i) => {
+      s._i = i;
+      s.folder = folderKey(s.folder);
+    });
     activeFolder = folderKey(localStorage.getItem('tw_active_folder') || '');
     if (!localStorage.getItem('tw_active_folder')) activeFolder = '';
-
-    // Une seule source : on l'utilise directement. Avec plusieurs dossiers,
-    // aucune liste globale mélangée n'est autorisée : il faut en choisir un.
-    if (!activeFolder && folders.length === 1) {
-      activeFolder = folders[0];
-      localStorage.setItem('tw_active_folder', activeFolder);
-    }
-
-    if (activeFolder && !folders.includes(activeFolder)) {
+    if (activeFolder && !songs.some(s => s.folder === activeFolder)) {
       activeFolder = '';
       localStorage.removeItem('tw_active_folder');
     }
-
-    folderIndices = activeFolder
-      ? songs.map((s, i) => ({s, i})).filter(x => folderKey(x.s.folder) === activeFolder).map(x => x.i)
-      : [];
-    resolveCurrentPos();
   }
 
-  function removeMixedChoice() {
-    const all = $('#twFolderList [data-tw-folder=""]');
-    if (all) all.remove();
+  function realFolders() {
+    return [...new Set(songs.map(s => s.folder))]
+      .sort((a, b) => a.localeCompare(b, 'fr', {sensitivity:'base'}));
   }
 
-  function enforceLibrary() {
+  function filterLibrary() {
+    readSongs();
     const list = $('#libList');
     if (!list) return;
-    const allowed = new Set(folderIndices);
     const rows = $$('[data-track]', list);
+    const count = $('#libCount');
+    const code = $('.screen[data-screen="library"] .scan code');
 
     if (!activeFolder) {
       rows.forEach(row => { row.hidden = true; });
-      const count = $('#libCount');
       if (count) count.textContent = songs.length ? 'Choisis un dossier' : '0 titre';
-      const code = $('.screen[data-screen="library"] .scan code');
       if (code && songs.length) code.textContent = 'Choisir un dossier';
       return;
     }
 
     let visible = 0;
     rows.forEach(row => {
-      const idx = Number(row.dataset.track);
-      const keep = allowed.has(idx);
+      const index = Number(row.dataset.track);
+      const s = songs[index];
+      const keep = !!s && folderKey(s.folder) === activeFolder;
       row.hidden = !keep;
       if (keep) visible++;
     });
-    const count = $('#libCount');
     if (count) count.textContent = `${visible} titre${visible !== 1 ? 's' : ''}`;
+    if (code) code.textContent = activeFolder;
   }
 
-  function enforceQueue() {
-    const list = $('#queueList');
-    if (!list || !activeFolder) return;
-    const allowed = new Set(folderIndices);
-    let visible = 0;
-    $$('[data-q]', list).forEach(row => {
-      const idx = Number(row.dataset.q);
-      const keep = allowed.has(idx);
-      row.hidden = !keep;
-      if (keep) visible++;
+  function fixFolderSheet() {
+    readSongs();
+    const host = $('#twFolderList');
+    if (!host) return;
+
+    const mixed = host.querySelector('[data-tw-folder=""]');
+    if (mixed) mixed.remove();
+
+    const rows = $$('[data-tw-folder]', host)
+      .filter(row => row.dataset.twFolder)
+      .sort((a, b) => folderKey(a.dataset.twFolder)
+        .localeCompare(folderKey(b.dataset.twFolder), 'fr', {sensitivity:'base'}));
+
+    rows.forEach(row => {
+      const folder = folderKey(row.dataset.twFolder);
+      const title = row.querySelector('strong');
+      const small = row.querySelector('small');
+      if (title) title.textContent = folder;
+      const n = songs.filter(s => s.folder === folder).length;
+      if (small) small.textContent = `${n} titre${n !== 1 ? 's' : ''}`;
+      host.appendChild(row);
     });
-    const label = $('.screen[data-screen="queue"] .q-label');
-    if (label) label.textContent = `À suivre — ${visible} titre${visible !== 1 ? 's' : ''} dans ce dossier`;
+
+    const count = $('#twFolderCount');
+    const folders = realFolders();
+    if (count) count.textContent = `${folders.length} dossier${folders.length !== 1 ? 's' : ''}`;
   }
 
-  function clearSearchAndForceTitles(done) {
-    const input = $('#searchInput');
-    if (input && input.value) {
-      input.value = '';
-      input.dispatchEvent(new Event('input', {bubbles:true}));
-    }
-    const titleChip = $('#libViews [data-view="titres"]');
-    if (titleChip && !titleChip.classList.contains('is-on')) titleChip.click();
-    requestAnimationFrame(done);
-  }
-
-  function playBaseIndex(baseIndex) {
-    if (!songs[baseIndex]) return;
-    const pos = folderIndices.indexOf(baseIndex);
-    if (pos >= 0) currentFolderPos = pos;
-
-    clearSearchAndForceTitles(() => {
-      const row = $(`#libList [data-track="${baseIndex}"]`);
-      if (row) {
-        row.hidden = false;
-        row.click();
-        requestAnimationFrame(() => {
-          enforceLibrary();
-          enforceQueue();
-        });
-      }
+  function scheduleRefresh() {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      fixFolderSheet();
+      filterLibrary();
     });
   }
 
-  function strictNext(fromEnd = false) {
-    rebuildFolder();
-    if (!activeFolder || !folderIndices.length) return;
-
-    const repeat = localStorage.getItem('tw_repeat') || 'off';
-    const shuffle = JSON.parse(localStorage.getItem('tw_shuffle') || 'false');
-    resolveCurrentPos();
-
-    if (fromEnd && repeat === 'one') {
-      playBaseIndex(folderIndices[currentFolderPos]);
-      return;
+  function syncNowPlaying(uri, title, artist) {
+    readSongs();
+    const index = songs.findIndex(s => String(s.uri) === String(uri));
+    if (index >= 0) {
+      const s = songs[index];
+      localStorage.setItem('tw_active_folder', s.folder);
+      activeFolder = s.folder;
+      const row = $(`#libList [data-track="${index}"]`);
+      const img = row?.querySelector('img');
+      const src = img?.getAttribute('src');
+      if (src) {
+        const cover = $('#coverImg');
+        const mini = $('#miniCover');
+        const np = $('#npCover');
+        if (cover) cover.src = src;
+        if (mini) mini.src = src;
+        if (np) np.src = src;
+      }
+      $$('#libList .row').forEach(r => r.classList.toggle('is-playing', Number(r.dataset.track) === index));
     }
 
-    let nextPos = currentFolderPos;
-    if (shuffle && folderIndices.length > 1) {
-      do { nextPos = Math.floor(Math.random() * folderIndices.length); }
-      while (nextPos === currentFolderPos);
-    } else {
-      nextPos += 1;
-      if (nextPos >= folderIndices.length) {
-        if (repeat === 'all') nextPos = 0;
-        else return;
-      }
+    if ($('#trackTitle')) $('#trackTitle').textContent = title || 'Sans titre';
+    if ($('#trackArtist')) $('#trackArtist').textContent = artist || 'Artiste inconnu';
+    if ($('#miniTitle')) $('#miniTitle').textContent = title || 'Sans titre';
+    if ($('#npTitle')) $('#npTitle').textContent = title || 'Sans titre';
+    if ($('#npArtist')) $('#npArtist').textContent = `${artist || 'Artiste inconnu'} · en cours`;
+    scheduleRefresh();
+  }
+
+  document.addEventListener('click', e => {
+    const folderRow = e.target.closest('#twFolderList [data-tw-folder]');
+    if (folderRow && folderRow.dataset.twFolder) {
+      localStorage.setItem('tw_active_folder', folderKey(folderRow.dataset.twFolder));
+      setTimeout(scheduleRefresh, 0);
     }
-    playBaseIndex(folderIndices[nextPos]);
-  }
 
-  function strictPrevious() {
-    rebuildFolder();
-    if (!activeFolder || !folderIndices.length) return;
+    const btn = e.target.closest('.controls .icon-btn');
+    if (!btn || !A) return;
+    const buttons = $$('.controls .icon-btn');
+    const pos = buttons.indexOf(btn);
+    const label = String(btn.getAttribute('aria-label') || '').toLowerCase();
+    const previous = label.includes('préc') || label.includes('preced') || pos === 1;
+    const next = label.includes('suiv') || pos === 2;
 
-    try {
-      const state = JSON.parse(safeCall('getPlaybackState') || '{}');
-      if ((Number(state.position) || 0) > 4000) {
-        safeCall('seekTo', 0);
-        return;
-      }
-    } catch (_) {}
+    if (previous && typeof A.previous === 'function') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      A.previous();
+    } else if (next && typeof A.next === 'function') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      A.next();
+    }
+  }, true);
 
-    resolveCurrentPos();
-    let prevPos = currentFolderPos - 1;
-    if (prevPos < 0) prevPos = folderIndices.length - 1;
-    playBaseIndex(folderIndices[prevPos]);
-  }
+  const observer = new MutationObserver(scheduleRefresh);
+  if (document.body) observer.observe(document.body, {childList:true, subtree:true});
 
-  function openFolderChoice() {
-    const scan = $('.screen[data-screen="library"] .scan');
-    if (scan) scan.click();
-  }
+  // Le service Android avance déjà dans le vrai dossier, même écran éteint.
+  // On empêche donc l'ancien JS de lancer une seconde fois le morceau suivant.
+  window.onNativeTrackEnded = () => {
+    if (typeof window.onNativePlaybackPaused === 'function') window.onNativePlaybackPaused();
+  };
 
-  function bindStrictControls() {
-    document.addEventListener('click', e => {
-      const row = e.target.closest('#libList [data-track]');
-      if (row && activeFolder) {
-        const idx = Number(row.dataset.track);
-        const pos = folderIndices.indexOf(idx);
-        if (pos < 0) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          return;
-        }
-        currentFolderPos = pos;
-      }
+  window.onNativeTrackChanged = (uri, title, artist) => {
+    syncNowPlaying(uri, title, artist);
+  };
 
-      const mode = e.target.closest('#libViews [data-view="albums"], #libViews [data-view="artistes"], #libViews [data-view="dossiers"]');
-      if (mode && !activeFolder && songs.length) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        openFolderChoice();
-        return;
-      }
-
-      const buttons = $$('.controls .icon-btn');
-      const btn = e.target.closest('.controls .icon-btn');
-      if (!btn || !activeFolder || !folderIndices.length) return;
-      const pos = buttons.indexOf(btn);
-      if (pos === 1) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        strictPrevious();
-      } else if (pos === 2) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        strictNext(false);
-      }
-    }, true);
-  }
-
-  function watchUi() {
-    const observer = new MutationObserver(() => {
-      if (syncing) return;
-      syncing = true;
-      requestAnimationFrame(() => {
-        removeMixedChoice();
-        enforceLibrary();
-        enforceQueue();
-        syncing = false;
-      });
-    });
-    observer.observe(document.body, {childList:true, subtree:true});
-
+  const init = () => {
+    readSongs();
+    fixFolderSheet();
+    filterLibrary();
     setInterval(() => {
       const stored = localStorage.getItem('tw_active_folder') || '';
-      if (stored !== lastFolder) {
-        lastFolder = stored;
-        rebuildFolder();
-        enforceLibrary();
-        enforceQueue();
-      }
-      removeMixedChoice();
-    }, 350);
-  }
-
-  function init() {
-    rebuildFolder();
-    lastFolder = localStorage.getItem('tw_active_folder') || '';
-    bindStrictControls();
-    watchUi();
-    removeMixedChoice();
-    enforceLibrary();
-    enforceQueue();
-
-    originalEnded = window.onNativeTrackEnded;
-    window.onNativeTrackEnded = () => {
-      rebuildFolder();
-      if (activeFolder && folderIndices.length) strictNext(true);
-      else if (typeof originalEnded === 'function') originalEnded();
-    };
-  }
+      if (stored !== activeFolder) scheduleRefresh();
+    }, 500);
+  };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
