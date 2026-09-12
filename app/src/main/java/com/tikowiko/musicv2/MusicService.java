@@ -50,6 +50,7 @@ public class MusicService extends Service {
     private float userVolume = .78f;
     private boolean prepared = false;
     private boolean pausedByFocus = false;
+    private boolean pausedByExternalMedia = false;
     private boolean ducked = false;
     private boolean pauseOnUnplug = true;
     private boolean normalize = true;
@@ -72,6 +73,7 @@ public class MusicService extends Service {
         IntentFilter f = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(noisyReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(noisyReceiver, f);
+        ExternalMediaMonitor.start(this);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -98,6 +100,9 @@ public class MusicService extends Service {
         title = t == null ? "Sans titre" : t;
         artist = ar == null ? "" : ar;
         stopAtEnd = false;
+        pausedByFocus = false;
+        pausedByExternalMedia = false;
+        ducked = false;
         releasePlayerOnly();
         player = new MediaPlayer();
         prepared = false;
@@ -147,6 +152,40 @@ public class MusicService extends Service {
                 requestFocus();
                 player.start();
                 pausedByFocus = false;
+                pausedByExternalMedia = false;
+                ducked = false;
+                applyVolume();
+                updateNotification();
+                MainActivity.dispatchToWeb("window.onNativePlaybackStarted && window.onNativePlaybackStarted();");
+            }
+        } catch (Exception ignored) {}
+    }
+
+    public boolean pauseForExternalMedia() {
+        if ("keep".equals(focusMode)) return false;
+        try {
+            if (player != null && prepared && player.isPlaying()) {
+                player.pause();
+                pausedByExternalMedia = true;
+                pausedByFocus = false;
+                updateNotification();
+                MainActivity.dispatchToWeb("window.onNativePlaybackPaused && window.onNativePlaybackPaused();");
+                return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    public void resumeAfterExternalMedia() {
+        if (!pausedByExternalMedia) return;
+        try {
+            if (player != null && prepared && !player.isPlaying()) {
+                requestFocus();
+                player.start();
+                pausedByExternalMedia = false;
+                pausedByFocus = false;
+                ducked = false;
+                applyVolume();
                 updateNotification();
                 MainActivity.dispatchToWeb("window.onNativePlaybackStarted && window.onNativePlaybackStarted();");
             }
@@ -154,6 +193,9 @@ public class MusicService extends Service {
     }
 
     private void stopPlayback() {
+        pausedByFocus = false;
+        pausedByExternalMedia = false;
+        ducked = false;
         releasePlayerOnly();
         abandonFocus();
         stopForeground(true);
@@ -170,7 +212,10 @@ public class MusicService extends Service {
     }
 
     private void setFocusMode(String mode) {
-        if ("duck".equals(mode) || "keep".equals(mode) || "pause".equals(mode)) focusMode = mode;
+        if ("duck".equals(mode) || "keep".equals(mode) || "pause".equals(mode)) {
+            focusMode = mode;
+            if ("keep".equals(mode) && pausedByExternalMedia) resumeAfterExternalMedia();
+        }
     }
 
     private void setAudioMode(String mode) {
@@ -192,13 +237,20 @@ public class MusicService extends Service {
     }
 
     private void requestFocus() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build();
-            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN).setAudioAttributes(attrs).setOnAudioFocusChangeListener(focusListener).build();
-            audioManager.requestAudioFocus(focusRequest);
-        } else {
-            audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-        }
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build();
+                focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(attrs)
+                        .setAcceptsDelayedFocusGain(false)
+                        .setWillPauseWhenDucked(false)
+                        .setOnAudioFocusChangeListener(focusListener, handler)
+                        .build();
+                audioManager.requestAudioFocus(focusRequest);
+            } else {
+                audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            }
+        } catch (Exception ignored) {}
     }
 
     private void abandonFocus() {
@@ -211,15 +263,48 @@ public class MusicService extends Service {
     private final AudioManager.OnAudioFocusChangeListener focusListener = change -> {
         if (change == AudioManager.AUDIOFOCUS_GAIN) {
             if (ducked) { ducked = false; applyVolume(); }
-            if (pausedByFocus) resume();
-        } else if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
-            if ("keep".equals(focusMode)) return;
-            if ("duck".equals(focusMode)) { ducked = true; applyVolume(); }
-            else pause(true);
-        } else if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT || change == AudioManager.AUDIOFOCUS_LOSS) {
-            if ("keep".equals(focusMode)) return;
-            if ("duck".equals(focusMode)) { ducked = true; applyVolume(); }
-            else pause(true);
+            if (pausedByFocus && !pausedByExternalMedia) resume();
+            else pausedByFocus = false;
+            return;
+        }
+
+        if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+            // Comme TikowikoMusic : les notifications ne doivent pas couper le morceau.
+            if ("duck".equals(focusMode)) {
+                ducked = true;
+                applyVolume();
+            } else {
+                ducked = false;
+                applyVolume();
+            }
+            return;
+        }
+
+        if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+            // Interruption temporaire forte (appel, assistant, etc.) : pause puis reprise.
+            pause(true);
+            return;
+        }
+
+        if (change == AudioManager.AUDIOFOCUS_LOSS) {
+            // Un jeu peut provoquer LOSS alors qu'il ne faut pas couper la musique.
+            // On ne met donc pas en pause ici. ExternalMediaMonitor décide si c'est
+            // réellement une vidéo / un lecteur média. Le mode "keep" l'ignore.
+            pausedByFocus = false;
+            if ("duck".equals(focusMode)) {
+                ducked = true;
+                applyVolume();
+            } else {
+                ducked = false;
+                applyVolume();
+                try {
+                    if ("keep".equals(focusMode) && player != null && prepared && !pausedByExternalMedia && !player.isPlaying()) {
+                        player.start();
+                        updateNotification();
+                        MainActivity.dispatchToWeb("window.onNativePlaybackStarted && window.onNativePlaybackStarted();");
+                    }
+                } catch (Exception ignored) {}
+            }
         }
     };
 
@@ -322,6 +407,7 @@ public class MusicService extends Service {
     @Override public void onDestroy() {
         if (sleepRunnable != null) handler.removeCallbacks(sleepRunnable);
         try { unregisterReceiver(noisyReceiver); } catch (Exception ignored) {}
+        ExternalMediaMonitor.stop();
         releasePlayerOnly();
         abandonFocus();
         if (instance == this) instance = null;
