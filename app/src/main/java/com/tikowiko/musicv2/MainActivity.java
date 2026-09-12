@@ -12,6 +12,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.MediaStore;
+import android.speech.RecognizerIntent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -24,10 +25,14 @@ import android.webkit.WebViewClient;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.File;
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Locale;
 
 public class MainActivity extends Activity {
     private static final int REQ_AUDIO = 501;
+    private static final int REQ_VOICE = 502;
     private static WeakReference<MainActivity> current = new WeakReference<>(null);
     private WebView webView;
 
@@ -65,6 +70,20 @@ public class MainActivity extends Activity {
         else requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQ_AUDIO);
     }
 
+    private void startVoiceSearchInternal() {
+        try {
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag());
+            intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Que veux-tu écouter ?");
+            intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
+            intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+            startActivityForResult(intent, REQ_VOICE);
+        } catch (Exception e) {
+            dispatchToWeb("window.onTikoBotVoiceError && window.onTikoBotVoiceError();");
+        }
+    }
+
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_AUDIO) {
@@ -73,81 +92,153 @@ public class MainActivity extends Activity {
         }
     }
 
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_VOICE) return;
+
+        if (resultCode == RESULT_OK && data != null) {
+            ArrayList<String> values = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (values != null && !values.isEmpty()) {
+                dispatchToWeb("window.onTikoBotVoiceResult && window.onTikoBotVoiceResult(" + JSONObject.quote(values.get(0)) + ");");
+                return;
+            }
+        }
+        dispatchToWeb("window.onTikoBotVoiceError && window.onTikoBotVoiceError();");
+    }
+
+    private String normalizeFolder(String rawPath) {
+        final String fallback = "Musique";
+        if (rawPath == null || rawPath.trim().isEmpty()) return fallback;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            String value = rawPath.replace('\\', '/').trim();
+            while (value.startsWith("/")) value = value.substring(1);
+            while (value.endsWith("/")) value = value.substring(0, value.length() - 1);
+            return value.isEmpty() ? fallback : value;
+        }
+        File parent = new File(rawPath).getParentFile();
+        if (parent == null || parent.getName() == null || parent.getName().trim().isEmpty()) return fallback;
+        return parent.getName().trim();
+    }
+
     private String getSongsJson() {
         JSONArray out = new JSONArray();
         if (!hasAudioPermissionInternal()) return out.toString();
         Uri collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
-        String[] projection = Build.VERSION.SDK_INT >= 29
-                ? new String[]{MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.MIME_TYPE, MediaStore.Audio.Media.RELATIVE_PATH}
-                : new String[]{MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.MIME_TYPE, MediaStore.Audio.Media.DATA};
-        String selection = MediaStore.Audio.Media.IS_MUSIC + "!=0 AND " + MediaStore.Audio.Media.DURATION + ">1000";
+        String folderColumnName = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                ? MediaStore.Audio.Media.RELATIVE_PATH
+                : MediaStore.Audio.Media.DATA;
+        String[] projection = new String[]{
+                MediaStore.Audio.Media._ID,
+                MediaStore.Audio.Media.TITLE,
+                MediaStore.Audio.Media.ARTIST,
+                MediaStore.Audio.Media.ALBUM,
+                MediaStore.Audio.Media.DURATION,
+                MediaStore.Audio.Media.MIME_TYPE,
+                folderColumnName
+        };
+        String selection = MediaStore.Audio.Media.IS_MUSIC + " != 0";
         String sort = MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC";
         try (Cursor c = getContentResolver().query(collection, projection, selection, null, sort)) {
             if (c == null) return out.toString();
-            int idCol=c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID), titleCol=c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE), artistCol=c.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST), albumCol=c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM), durationCol=c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION), mimeCol=c.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE);
-            int pathCol = Build.VERSION.SDK_INT >= 29 ? c.getColumnIndexOrThrow(MediaStore.Audio.Media.RELATIVE_PATH) : c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA);
+            int idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
+            int titleCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE);
+            int artistCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST);
+            int albumCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM);
+            int durationCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION);
+            int mimeCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE);
+            int folderCol = c.getColumnIndexOrThrow(folderColumnName);
             while (c.moveToNext()) {
-                long id=c.getLong(idCol), duration=c.getLong(durationCol);
-                String title=c.getString(titleCol), artist=c.getString(artistCol), album=c.getString(albumCol), mime=c.getString(mimeCol), path=c.getString(pathCol);
-                JSONObject o=new JSONObject();
-                o.put("id",id); o.put("title",title==null||title.isEmpty()?"Sans titre":title);
-                o.put("artist",artist==null||artist.isEmpty()||"<unknown>".equals(artist)?"Artiste inconnu":artist);
-                o.put("album",album==null||album.isEmpty()?"Album inconnu":album); o.put("duration",duration);
-                o.put("mime",mime==null?"audio":mime); o.put("folder",path==null?"Musique":path);
-                o.put("uri",ContentUris.withAppendedId(collection,id).toString()); out.put(o);
+                long id = c.getLong(idCol);
+                long duration = Math.max(0L, c.getLong(durationCol));
+                String title = c.getString(titleCol);
+                String artist = c.getString(artistCol);
+                String album = c.getString(albumCol);
+                String mime = c.getString(mimeCol);
+                String folder = normalizeFolder(c.getString(folderCol));
+                JSONObject o = new JSONObject();
+                o.put("id", id);
+                o.put("title", title == null || title.trim().isEmpty() ? "Sans titre" : title.trim());
+                o.put("artist", artist == null || artist.trim().isEmpty() || "<unknown>".equals(artist) ? "Artiste inconnu" : artist.trim());
+                o.put("album", album == null || album.trim().isEmpty() ? "Album inconnu" : album.trim());
+                o.put("duration", duration);
+                o.put("mime", mime == null ? "audio" : mime);
+                o.put("folder", folder);
+                o.put("uri", ContentUris.withAppendedId(collection, id).toString());
+                out.put(o);
             }
         } catch (Exception ignored) {}
         return out.toString();
     }
 
     private String getOutputsJson() {
-        JSONArray out=new JSONArray();
+        JSONArray out = new JSONArray();
         try {
-            AudioManager am=(AudioManager)getSystemService(AUDIO_SERVICE);
-            for (AudioDeviceInfo d:am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                JSONObject o=new JSONObject(); CharSequence p=d.getProductName();
-                o.put("name",p==null||p.length()==0?typeName(d.getType()):p.toString()); o.put("type",typeName(d.getType())); out.put(o);
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                JSONObject o = new JSONObject();
+                CharSequence p = d.getProductName();
+                o.put("name", p == null || p.length() == 0 ? typeName(d.getType()) : p.toString());
+                o.put("type", typeName(d.getType()));
+                out.put(o);
             }
         } catch (Exception ignored) {}
         return out.toString();
     }
 
     private String typeName(int type) {
-        switch(type){
-            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:return "Bluetooth";
-            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:return "Bluetooth appel";
-            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:return "Casque filaire";
-            case AudioDeviceInfo.TYPE_WIRED_HEADSET:return "Kit mains libres";
-            case AudioDeviceInfo.TYPE_USB_HEADSET:return "Casque USB";
-            case AudioDeviceInfo.TYPE_USB_DEVICE:return "Audio USB";
-            case AudioDeviceInfo.TYPE_HDMI:return "HDMI";
-            case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER:return "Haut-parleur";
-            default:return "Sortie audio";
+        switch(type) {
+            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP: return "Bluetooth";
+            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO: return "Bluetooth appel";
+            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES: return "Casque filaire";
+            case AudioDeviceInfo.TYPE_WIRED_HEADSET: return "Kit mains libres";
+            case AudioDeviceInfo.TYPE_USB_HEADSET: return "Casque USB";
+            case AudioDeviceInfo.TYPE_USB_DEVICE: return "Audio USB";
+            case AudioDeviceInfo.TYPE_HDMI: return "HDMI";
+            case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER: return "Haut-parleur";
+            default: return "Sortie audio";
         }
     }
 
-    private void command(String action) { startService(new Intent(this,MusicService.class).setAction(action)); }
-    private void command(String action,String key,String value) { startService(new Intent(this,MusicService.class).setAction(action).putExtra(key,value)); }
+    private void command(String action) { startService(new Intent(this, MusicService.class).setAction(action)); }
+    private void command(String action, String key, String value) { startService(new Intent(this, MusicService.class).setAction(action).putExtra(key, value)); }
 
     public class AndroidBridge {
-        @JavascriptInterface public boolean hasAudioPermission(){return hasAudioPermissionInternal();}
-        @JavascriptInterface public void requestAudioPermission(){runOnUiThread(()->requestAudioPermissionInternal());}
-        @JavascriptInterface public String getSongs(){return getSongsJson();}
-        @JavascriptInterface public String getAudioOutputs(){return getOutputsJson();}
-        @JavascriptInterface public void play(String uri,String title,String artist){Intent i=new Intent(MainActivity.this,MusicService.class).setAction(MusicService.ACTION_PLAY).putExtra("uri",uri).putExtra("title",title).putExtra("artist",artist);startService(i);}
-        @JavascriptInterface public void pause(){command(MusicService.ACTION_PAUSE);}
-        @JavascriptInterface public void resume(){command(MusicService.ACTION_RESUME);}
-        @JavascriptInterface public void stop(){command(MusicService.ACTION_STOP);}
-        @JavascriptInterface public void seekTo(int ms){startService(new Intent(MainActivity.this,MusicService.class).setAction(MusicService.ACTION_SEEK).putExtra("ms",ms));}
-        @JavascriptInterface public void setVolume(int percent){startService(new Intent(MainActivity.this,MusicService.class).setAction(MusicService.ACTION_VOLUME).putExtra("percent",percent));}
-        @JavascriptInterface public void setFocusMode(String mode){command(MusicService.ACTION_FOCUS,"mode",mode);}
-        @JavascriptInterface public void setAudioMode(String mode){command(MusicService.ACTION_MODE,"mode",mode);}
-        @JavascriptInterface public void setPauseOnUnplug(boolean enabled){command(MusicService.ACTION_NOISY,"enabled",String.valueOf(enabled));}
-        @JavascriptInterface public void setNormalization(boolean enabled){command(MusicService.ACTION_NORMALIZE,"enabled",String.valueOf(enabled));}
-        @JavascriptInterface public void setSleepTimer(String value){command(MusicService.ACTION_SLEEP,"value",value);}
-        @JavascriptInterface public String getPlaybackState(){MusicService m=MusicService.getInstance();return m==null?"{\"playing\":false,\"position\":0,\"duration\":0}":m.getStateJson();}
+        @JavascriptInterface public boolean hasAudioPermission() { return hasAudioPermissionInternal(); }
+        @JavascriptInterface public void requestAudioPermission() { runOnUiThread(() -> requestAudioPermissionInternal()); }
+        @JavascriptInterface public void startVoiceSearch() { runOnUiThread(() -> startVoiceSearchInternal()); }
+        @JavascriptInterface public String getSongs() { return getSongsJson(); }
+        @JavascriptInterface public String getAudioOutputs() { return getOutputsJson(); }
+        @JavascriptInterface public void play(String uri, String title, String artist) {
+            Intent i = new Intent(MainActivity.this, MusicService.class)
+                    .setAction(MusicService.ACTION_PLAY)
+                    .putExtra("uri", uri)
+                    .putExtra("title", title)
+                    .putExtra("artist", artist);
+            startService(i);
+        }
+        @JavascriptInterface public void pause() { command(MusicService.ACTION_PAUSE); }
+        @JavascriptInterface public void resume() { command(MusicService.ACTION_RESUME); }
+        @JavascriptInterface public void stop() { command(MusicService.ACTION_STOP); }
+        @JavascriptInterface public void seekTo(int ms) { startService(new Intent(MainActivity.this, MusicService.class).setAction(MusicService.ACTION_SEEK).putExtra("ms", ms)); }
+        @JavascriptInterface public void setVolume(int percent) { startService(new Intent(MainActivity.this, MusicService.class).setAction(MusicService.ACTION_VOLUME).putExtra("percent", percent)); }
+        @JavascriptInterface public void setFocusMode(String mode) { command(MusicService.ACTION_FOCUS, "mode", mode); }
+        @JavascriptInterface public void setAudioMode(String mode) { command(MusicService.ACTION_MODE, "mode", mode); }
+        @JavascriptInterface public void setPauseOnUnplug(boolean enabled) { command(MusicService.ACTION_NOISY, "enabled", String.valueOf(enabled)); }
+        @JavascriptInterface public void setNormalization(boolean enabled) { command(MusicService.ACTION_NORMALIZE, "enabled", String.valueOf(enabled)); }
+        @JavascriptInterface public void setSleepTimer(String value) { command(MusicService.ACTION_SLEEP, "value", value); }
+        @JavascriptInterface public String getPlaybackState() {
+            MusicService m = MusicService.getInstance();
+            return m == null ? "{\"playing\":false,\"position\":0,\"duration\":0}" : m.getStateJson();
+        }
     }
 
-    @Override public void onBackPressed(){if(webView!=null&&webView.canGoBack())webView.goBack();else super.onBackPressed();}
-    @Override protected void onDestroy(){if(current.get()==this)current.clear();super.onDestroy();}
+    @Override public void onBackPressed() {
+        if (webView != null && webView.canGoBack()) webView.goBack();
+        else super.onBackPressed();
+    }
+
+    @Override protected void onDestroy() {
+        if (current.get() == this) current.clear();
+        super.onDestroy();
+    }
 }
