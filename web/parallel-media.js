@@ -1,11 +1,30 @@
-/* tikoWiko Musique 1.6.1 — garder la musique pendant les vidéos/autres médias */
+/* tikoWiko Musique — gestion vidéo/média externe comme la première TikowikoMusic */
 (() => {
   'use strict';
 
   const $ = (s, r = document) => r.querySelector(s);
   const A = window.Android || null;
 
-  let parallelMedia = JSON.parse(localStorage.getItem('tw_parallel_media') || 'true');
+  /*
+   * IMPORTANT : le comportement normal est maintenant celui de la première
+   * TikowikoMusic : Netflix / vidéo / vrai lecteur média met la musique en pause,
+   * puis la lecture reprend automatiquement quand le média externe s'arrête.
+   *
+   * L'ancien mode "Vidéo + musique" forçait focus=keep et empêchait précisément
+   * cette détection. On le laisse disponible comme option volontaire, mais il est
+   * désactivé par défaut et une migration coupe l'ancien réglage une seule fois.
+   */
+  const POLICY_VERSION = '2';
+  const policyKey = 'tw_external_video_policy_version';
+  const needsMigration = localStorage.getItem(policyKey) !== POLICY_VERSION;
+  if (needsMigration) {
+    localStorage.setItem('tw_parallel_media', 'false');
+    localStorage.setItem('tw_focus', 'pause');
+    localStorage.removeItem('tw_parallel_prev_focus');
+    localStorage.setItem(policyKey, POLICY_VERSION);
+  }
+
+  let parallelMedia = JSON.parse(localStorage.getItem('tw_parallel_media') || 'false');
 
   function safeCall(name, ...args) {
     try { return A && typeof A[name] === 'function' ? A[name](...args) : null; }
@@ -42,14 +61,24 @@
       const setVal = $('#setFocusVal');
       if (setVal) setVal.textContent = 'Continuer';
     } else {
-      const previous = localStorage.getItem('tw_parallel_prev_focus') || 'pause';
-      localStorage.setItem('tw_focus', previous);
-      safeCall('setFocusMode', previous);
+      // Comportement TikowikoMusic V1 : le moniteur Android gère les vraies
+      // vidéos/médias externes et reprend ensuite automatiquement.
+      localStorage.setItem('tw_focus', 'pause');
+      safeCall('setFocusMode', 'pause');
       localStorage.removeItem('tw_parallel_prev_focus');
+
+      const chip = $('#focusChipText');
+      if (chip) chip.textContent = 'Focus audio · vidéo prioritaire';
+      const setVal = $('#setFocusVal');
+      if (setVal) setVal.textContent = 'Pause vidéo';
     }
 
     renderParallelCard();
-    if (announce) toast(parallelMedia ? 'La musique continuera avec les vidéos' : 'Lecture parallèle désactivée');
+    if (announce) {
+      toast(parallelMedia
+        ? 'La musique continuera avec les vidéos'
+        : 'Netflix et les vidéos mettront la musique en pause');
+    }
   }
 
   function renderParallelCard() {
@@ -62,7 +91,11 @@
       sw.setAttribute('aria-checked', String(parallelMedia));
     }
     const state = $('#twParallelState');
-    if (state) state.textContent = parallelMedia ? 'Actif · la musique reste en lecture' : 'Désactivé';
+    if (state) {
+      state.textContent = parallelMedia
+        ? 'Actif · la musique reste en lecture'
+        : 'Désactivé · pause automatique pour les vidéos';
+    }
   }
 
   function injectParallelCard() {
@@ -77,10 +110,10 @@
     card.innerHTML = `
       <button class="tw-hearing-main" id="twParallelMain" type="button">
         <span class="tw-hearing-icon">▶</span>
-        <span class="tw-hearing-copy"><strong>Vidéo + musique</strong><small id="twParallelState">Actif · la musique reste en lecture</small></span>
-        <span class="tw-switch is-on" id="twParallelSwitch" role="switch" aria-checked="true"><i></i></span>
+        <span class="tw-hearing-copy"><strong>Vidéo + musique</strong><small id="twParallelState">Désactivé · pause automatique pour les vidéos</small></span>
+        <span class="tw-switch" id="twParallelSwitch" role="switch" aria-checked="false"><i></i></span>
       </button>
-      <div class="tw-hearing-info"><span>Lecture parallèle</span><small>Quand une autre application vidéo ou média demande le son, tikoWiko continue de jouer. Android ne fournit pas toujours le type de l’application : ce réglage s’applique donc globalement aux autres médias.</small></div>`;
+      <div class="tw-hearing-info"><span>Lecture parallèle</span><small>Désactivé par défaut : Netflix, les vidéos et les vrais lecteurs média mettent tikoWiko en pause, puis la musique reprend quand ils s'arrêtent. Active ce réglage uniquement si tu veux vraiment entendre les deux en même temps.</small></div>`;
 
     if (hearing) hearing.after(card);
     else player.appendChild(card);
@@ -102,13 +135,12 @@
   }
 
   function keepPlayingInBackground() {
-    // L'ancien lecteur peut être réglé sur « pas d'arrière-plan ».
-    // Quand la lecture parallèle est active, on bloque cette pause au passage vers une autre app.
+    // Ce bloc ne s'applique que si l'utilisateur active volontairement
+    // "Vidéo + musique". Sinon le moniteur Android V1 garde la priorité vidéo.
     document.addEventListener('visibilitychange', e => {
       if (!parallelMedia || !document.hidden) return;
       localStorage.setItem('tw_background', 'true');
       safeCall('setFocusMode', 'keep');
-      // Le gestionnaire historique est installé sans capture ; ici on passe avant lui.
       e.stopImmediatePropagation();
     }, true);
   }
@@ -119,7 +151,7 @@
     keepPlayingInBackground();
     applyParallelMedia(false);
     const foot = $('.set-foot');
-    if (foot) foot.innerHTML = 'tikoWiko Musique 1.6.1 · Lecteur local Android<br>© 2026 tikoWikoFamily';
+    if (foot) foot.innerHTML = 'tikoWiko Musique · Lecteur local Android<br>© 2026 tikoWikoFamily';
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
