@@ -1,4 +1,4 @@
-/* TikoBot — assistant local pour rechercher et lancer la musique du téléphone */
+/* TikoBot — assistant local pour rechercher, commenter et lancer la musique du téléphone */
 (() => {
   'use strict';
 
@@ -87,8 +87,8 @@
     $('#tikobotInput')?.addEventListener('keydown', e => { if (e.key === 'Enter') runInput(); });
     $('#tikobotMic')?.addEventListener('click', () => {
       const ok = safeCall('startVoiceSearch');
-      if (ok === null) reply('La recherche vocale n’est pas disponible ici. Tu peux écrire ta demande.');
-      else reply('Je t’écoute…');
+      if (ok === null) reply('La recherche vocale n’est pas disponible ici. Tu peux écrire ta demande.', true);
+      else reply('Je t’écoute…', true);
     });
   }
 
@@ -98,7 +98,7 @@
     if (!sheet) return;
     sheet.hidden = false;
     if (!songs.length) {
-      reply('Ta bibliothèque est vide. Ajoute tes propres musiques sur le téléphone puis relance la recherche.');
+      reply('Ta bibliothèque est vide. Ajoute tes propres musiques sur le téléphone puis relance la recherche.', true);
     } else {
       reply(`${songs.length} titre${songs.length > 1 ? 's' : ''} disponible${songs.length > 1 ? 's' : ''}. Que veux-tu écouter ?`);
     }
@@ -106,13 +106,31 @@
   }
 
   function close() {
+    safeCall('stopTikoBotVoice');
     const sheet = $('#tikobotSheet');
     if (sheet) sheet.hidden = true;
   }
 
-  function reply(text) {
+  function reply(text, speak = false) {
     const el = $('#tikobotReply');
     if (el) el.textContent = text;
+    if (speak) safeCall('speakTikoBot', String(text || ''));
+  }
+
+  function opinionFor(song) {
+    const key = `${song?.title || ''}|${song?.artist || ''}`;
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) hash = ((hash * 31) + key.charCodeAt(i)) >>> 0;
+    const opinions = [
+      'Bon choix, celle-là a une super énergie.',
+      'Ah oui, celle-ci je la valide.',
+      'Pas mal du tout, je la mettrais bien dans une playlist.',
+      'Celle-là passe vraiment bien, j’aime le choix.',
+      'Hmm… un peu moins mon style, mais elle a quelque chose.',
+      'Ça, c’est un morceau que je réécouterais volontiers.',
+      'Très bon choix, elle a une belle ambiance.'
+    ];
+    return opinions[hash % opinions.length];
   }
 
   function runInput() {
@@ -152,7 +170,7 @@
       .map(x => x.i);
   }
 
-  function playIndex(index) {
+  function playIndex(index, comment = true) {
     const song = songs[index];
     if (!song) return;
     localStorage.setItem('tw_active_folder', folderKey(song.folder));
@@ -174,18 +192,23 @@
         safeCall('play', song.uri, song.title, song.artist);
       }
     });
-    reply(`Lecture : ${song.title} — ${song.artist}`);
+
+    if (comment) {
+      reply(`Je lance ${song.title}. ${opinionFor(song)}`, true);
+    } else {
+      reply(`Lecture : ${song.title} — ${song.artist}`);
+    }
   }
 
   function playQueue(indices, label) {
     queue = [...new Set(indices)].filter(i => songs[i]);
     queuePos = 0;
     if (!queue.length) {
-      reply(`Je n’ai rien trouvé pour ${label}.`);
+      reply(`Je n’ai rien trouvé pour ${label}.`, true);
       return;
     }
-    playIndex(queue[0]);
-    reply(`${label} · ${queue.length} titre${queue.length > 1 ? 's' : ''} en file de lecture`);
+    playIndex(queue[0], false);
+    reply(`${label}. ${queue.length} titre${queue.length > 1 ? 's' : ''} en file de lecture.`, true);
   }
 
   function showMatches(query) {
@@ -197,7 +220,7 @@
     if (!host) return;
     if (!ranked.length) {
       host.innerHTML = '';
-      reply(`Je n’ai trouvé aucun morceau correspondant à « ${query} » dans ton téléphone.`);
+      reply(`Je n’ai trouvé aucun morceau correspondant à « ${query} » dans ton téléphone.`, true);
       return;
     }
     host.innerHTML = ranked.map(x => `
@@ -209,9 +232,9 @@
     $$('[data-ti]', host).forEach(b => b.addEventListener('click', () => {
       queue = [];
       queuePos = -1;
-      playIndex(Number(b.dataset.ti));
+      playIndex(Number(b.dataset.ti), true);
     }));
-    reply(`${ranked.length} résultat${ranked.length > 1 ? 's' : ''} trouvé${ranked.length > 1 ? 's' : ''}.`);
+    reply(`${ranked.length} résultat${ranked.length > 1 ? 's' : ''} trouvé${ranked.length > 1 ? 's' : ''}.`, true);
   }
 
   function cleanCommand(text) {
@@ -229,8 +252,8 @@
     const results = $('#tikobotResults');
     if (results) results.innerHTML = '';
 
-    if (!raw) return reply('Dis-moi un titre, un artiste, un album ou un dossier.');
-    if (!songs.length) return reply('Je ne trouve aucune musique sur ce téléphone.');
+    if (!raw) return reply('Dis-moi un titre, un artiste, un album ou un dossier.', true);
+    if (!songs.length) return reply('Je ne trouve aucune musique sur ce téléphone.', true);
 
     let m = normalized.match(/(?:album)\s+(.+)/);
     if (m) {
@@ -261,7 +284,7 @@
     if (ranked.length && ranked[0].score >= 75) {
       queue = [];
       queuePos = -1;
-      return playIndex(ranked[0].i);
+      return playIndex(ranked[0].i, true);
     }
     showMatches(q);
   }
@@ -275,7 +298,7 @@
 
   window.onTikoBotVoiceError = () => {
     ensureUi();
-    reply('Je n’ai pas compris. Réessaie ou écris ta demande.');
+    reply('Je n’ai pas compris. Réessaie ou écris ta demande.', true);
   };
 
   function init() {
@@ -285,7 +308,7 @@
     window.onNativeTrackEnded = () => {
       if (queue.length && queuePos >= 0 && queuePos + 1 < queue.length) {
         queuePos += 1;
-        playIndex(queue[queuePos]);
+        playIndex(queue[queuePos], false);
         return;
       }
       if (queue.length) {
