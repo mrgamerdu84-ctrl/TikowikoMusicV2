@@ -41,6 +41,7 @@ jobs:
           cp web/parallel-media.js app/src/main/assets/www/parallel-media.js
           cp web/library-playlists.js app/src/main/assets/www/library-playlists.js
           cp web/library-playlists.css app/src/main/assets/www/library-playlists.css
+          cp web/folder-strict.js app/src/main/assets/www/folder-strict.js
           python3 - <<'PY'
           from pathlib import Path
           p = Path('app/src/main/assets/www/index.html')
@@ -57,6 +58,7 @@ jobs:
               '<script src="enhancements.js"></script>',
               '<script src="parallel-media.js"></script>',
               '<script src="library-playlists.js"></script>',
+              '<script src="folder-strict.js"></script>',
           ]
           for script in scripts:
               if script not in s:
