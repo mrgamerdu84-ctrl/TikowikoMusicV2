@@ -95,7 +95,6 @@ public class MainActivity extends Activity {
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != REQ_VOICE) return;
-
         if (resultCode == RESULT_OK && data != null) {
             ArrayList<String> values = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
             if (values != null && !values.isEmpty()) {
@@ -124,16 +123,10 @@ public class MainActivity extends Activity {
         JSONArray out = new JSONArray();
         if (!hasAudioPermissionInternal()) return out.toString();
         Uri collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
-        String folderColumnName = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                ? MediaStore.Audio.Media.RELATIVE_PATH
-                : MediaStore.Audio.Media.DATA;
+        String folderColumnName = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ? MediaStore.Audio.Media.RELATIVE_PATH : MediaStore.Audio.Media.DATA;
         String[] projection = new String[]{
-                MediaStore.Audio.Media._ID,
-                MediaStore.Audio.Media.TITLE,
-                MediaStore.Audio.Media.ARTIST,
-                MediaStore.Audio.Media.ALBUM,
-                MediaStore.Audio.Media.DURATION,
-                MediaStore.Audio.Media.MIME_TYPE,
+                MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST,
+                MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.MIME_TYPE,
                 folderColumnName
         };
         String selection = MediaStore.Audio.Media.IS_MUSIC + " != 0";
@@ -150,10 +143,7 @@ public class MainActivity extends Activity {
             while (c.moveToNext()) {
                 long id = c.getLong(idCol);
                 long duration = Math.max(0L, c.getLong(durationCol));
-                String title = c.getString(titleCol);
-                String artist = c.getString(artistCol);
-                String album = c.getString(albumCol);
-                String mime = c.getString(mimeCol);
+                String title = c.getString(titleCol), artist = c.getString(artistCol), album = c.getString(albumCol), mime = c.getString(mimeCol);
                 String folder = normalizeFolder(c.getString(folderCol));
                 JSONObject o = new JSONObject();
                 o.put("id", id);
@@ -168,6 +158,59 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {}
         return out.toString();
+    }
+
+    /**
+     * Même principe que la première TikowikoMusic : la file native est construite
+     * avec les morceaux qui ont exactement le même chemin physique Android.
+     * Elle vit ensuite dans le service, donc elle continue même si la WebView
+     * ou l'activité n'est plus au premier plan.
+     */
+    private JSONObject buildPhysicalFolderQueue(String selectedUri, String fallbackTitle, String fallbackArtist) {
+        JSONObject payload = new JSONObject();
+        JSONArray queue = new JSONArray();
+        int selectedIndex = 0;
+        try {
+            JSONArray all = new JSONArray(getSongsJson());
+            String folder = null;
+            for (int i = 0; i < all.length(); i++) {
+                JSONObject song = all.optJSONObject(i);
+                if (song != null && selectedUri.equals(song.optString("uri"))) {
+                    folder = song.optString("folder", "Musique");
+                    break;
+                }
+            }
+            if (folder != null) {
+                for (int i = 0; i < all.length(); i++) {
+                    JSONObject song = all.optJSONObject(i);
+                    if (song == null || !folder.equals(song.optString("folder", "Musique"))) continue;
+                    JSONObject q = new JSONObject();
+                    q.put("uri", song.optString("uri"));
+                    q.put("title", song.optString("title", "Sans titre"));
+                    q.put("artist", song.optString("artist", "Artiste inconnu"));
+                    q.put("folder", folder);
+                    if (selectedUri.equals(song.optString("uri"))) selectedIndex = queue.length();
+                    queue.put(q);
+                }
+            }
+        } catch (Exception ignored) {}
+
+        if (queue.length() == 0) {
+            try {
+                JSONObject q = new JSONObject();
+                q.put("uri", selectedUri);
+                q.put("title", fallbackTitle == null ? "Sans titre" : fallbackTitle);
+                q.put("artist", fallbackArtist == null ? "Artiste inconnu" : fallbackArtist);
+                q.put("folder", "Musique");
+                queue.put(q);
+                selectedIndex = 0;
+            } catch (Exception ignored) {}
+        }
+        try {
+            payload.put("queue", queue);
+            payload.put("index", selectedIndex);
+        } catch (Exception ignored) {}
+        return payload;
     }
 
     private String getOutputsJson() {
@@ -199,6 +242,11 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void startPlaybackService(Intent intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
+        else startService(intent);
+    }
+
     private void command(String action) { startService(new Intent(this, MusicService.class).setAction(action)); }
     private void command(String action, String key, String value) { startService(new Intent(this, MusicService.class).setAction(action).putExtra(key, value)); }
 
@@ -208,17 +256,31 @@ public class MainActivity extends Activity {
         @JavascriptInterface public void startVoiceSearch() { runOnUiThread(() -> startVoiceSearchInternal()); }
         @JavascriptInterface public String getSongs() { return getSongsJson(); }
         @JavascriptInterface public String getAudioOutputs() { return getOutputsJson(); }
+
         @JavascriptInterface public void play(String uri, String title, String artist) {
+            if (uri == null || uri.trim().isEmpty()) return;
+            JSONObject payload = buildPhysicalFolderQueue(uri, title, artist);
+            JSONArray queue = payload.optJSONArray("queue");
             Intent i = new Intent(MainActivity.this, MusicService.class)
-                    .setAction(MusicService.ACTION_PLAY)
-                    .putExtra("uri", uri)
-                    .putExtra("title", title)
-                    .putExtra("artist", artist);
-            startService(i);
+                    .setAction(MusicService.ACTION_PLAY_QUEUE)
+                    .putExtra("queue", queue == null ? "[]" : queue.toString())
+                    .putExtra("index", payload.optInt("index", 0));
+            startPlaybackService(i);
         }
+
+        @JavascriptInterface public void playQueue(String queueJson, int index) {
+            Intent i = new Intent(MainActivity.this, MusicService.class)
+                    .setAction(MusicService.ACTION_PLAY_QUEUE)
+                    .putExtra("queue", queueJson == null ? "[]" : queueJson)
+                    .putExtra("index", Math.max(0, index));
+            startPlaybackService(i);
+        }
+
         @JavascriptInterface public void pause() { command(MusicService.ACTION_PAUSE); }
         @JavascriptInterface public void resume() { command(MusicService.ACTION_RESUME); }
         @JavascriptInterface public void stop() { command(MusicService.ACTION_STOP); }
+        @JavascriptInterface public void next() { command(MusicService.ACTION_NEXT); }
+        @JavascriptInterface public void previous() { command(MusicService.ACTION_PREVIOUS); }
         @JavascriptInterface public void seekTo(int ms) { startService(new Intent(MainActivity.this, MusicService.class).setAction(MusicService.ACTION_SEEK).putExtra("ms", ms)); }
         @JavascriptInterface public void setVolume(int percent) { startService(new Intent(MainActivity.this, MusicService.class).setAction(MusicService.ACTION_VOLUME).putExtra("percent", percent)); }
         @JavascriptInterface public void setFocusMode(String mode) { command(MusicService.ACTION_FOCUS, "mode", mode); }
