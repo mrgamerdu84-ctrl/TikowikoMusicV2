@@ -40,11 +40,13 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private boolean pendingOpenLibrary = false;
+    private TikoBotVoice tikoBotVoice;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         current = new WeakReference<>(this);
         pendingOpenLibrary = getIntent() != null && getIntent().getBooleanExtra("openLibrary", false);
+        tikoBotVoice = new TikoBotVoice(this);
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
@@ -345,6 +347,16 @@ public class MainActivity extends Activity {
         @JavascriptInterface public void startVoiceSearch() { runOnUiThread(() -> startVoiceSearchInternal()); }
         @JavascriptInterface public String getSongs() { return getSongsJson(); }
         @JavascriptInterface public String getAudioOutputs() { return getOutputsJson(); }
+        @JavascriptInterface public void speakTikoBot(String text) {
+            runOnUiThread(() -> {
+                if (tikoBotVoice != null) tikoBotVoice.speak(text);
+            });
+        }
+        @JavascriptInterface public void stopTikoBotVoice() {
+            runOnUiThread(() -> {
+                if (tikoBotVoice != null) tikoBotVoice.stop();
+            });
+        }
 
         @JavascriptInterface public void play(String uri, String title, String artist) {
             if (uri == null || uri.trim().isEmpty()) return;
@@ -396,6 +408,10 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         if (current.get() == this) current.clear();
+        if (tikoBotVoice != null) {
+            tikoBotVoice.shutdown();
+            tikoBotVoice = null;
+        }
         super.onDestroy();
     }
 }
