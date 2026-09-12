@@ -45,6 +45,7 @@ jobs:
           cp web/tikobot.js app/src/main/assets/www/tikobot.js
           cp web/tikobot.css app/src/main/assets/www/tikobot.css
           cp web/tikobot-visual.js app/src/main/assets/www/tikobot-visual.js
+          cp web/tikobot-life.js app/src/main/assets/www/tikobot-life.js
           cp web/tikobot-greeting.js app/src/main/assets/www/tikobot-greeting.js
           python3 - <<'PY'
           from pathlib import Path
@@ -66,6 +67,7 @@ jobs:
               '<script src="folder-strict.js"></script>',
               '<script src="tikobot.js"></script>',
               '<script src="tikobot-visual.js"></script>',
+              '<script src="tikobot-life.js"></script>',
               '<script src="tikobot-greeting.js"></script>',
           ]
           for script in scripts:
