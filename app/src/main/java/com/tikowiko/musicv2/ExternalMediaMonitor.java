@@ -1,6 +1,7 @@
 package com.tikowiko.musicv2;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
@@ -22,8 +23,8 @@ import java.util.regex.Pattern;
  * - une vraie lecture vidéo/média peut mettre en pause si le mode Focus n'est pas "keep" ;
  * - la reprise est automatique quand le média externe s'arrête.
  *
- * Cette version expose aussi l'état audio des jeux au MusicService afin qu'un
- * jeu qui demande un focus transitoire ne mette plus le lecteur en pause.
+ * Certains jeux demandent un focus audio transitoire ou se déclarent en MEDIA.
+ * On les détecte séparément et on protège la lecture pendant leur démarrage.
  */
 public final class ExternalMediaMonitor {
     private static final Handler handler = new Handler(Looper.getMainLooper());
@@ -33,7 +34,10 @@ public final class ExternalMediaMonitor {
     private static boolean pausedByExternalMedia = false;
     private static volatile boolean externalMediaActive = false;
     private static volatile boolean gameAudioActive = false;
+    private static boolean musicWasPlayingBeforeGame = false;
+    private static int gameGuardAttempt = 0;
     private static Runnable pendingResume;
+    private static Runnable gameFocusGuard;
 
     private ExternalMediaMonitor() {}
 
@@ -55,6 +59,7 @@ public final class ExternalMediaMonitor {
 
     public static void stop() {
         cancelPendingResume();
+        cancelGameGuard();
         if (audioManager != null && callback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try { audioManager.unregisterAudioPlaybackCallback(callback); } catch (Exception ignored) {}
         }
@@ -64,22 +69,19 @@ public final class ExternalMediaMonitor {
         pausedByExternalMedia = false;
         externalMediaActive = false;
         gameAudioActive = false;
+        musicWasPlayingBeforeGame = false;
     }
 
     public static boolean isExternalMediaActive() {
         return externalMediaActive;
     }
 
-    /**
-     * Utilisé par MusicService pour ignorer les pertes de focus provoquées par
-     * les jeux. Certains jeux annoncent USAGE_MEDIA au lieu de USAGE_GAME ; on
-     * les reconnaît alors par leur catégorie Android quand l'UID est visible.
-     */
     public static boolean isGameAudioActive() {
         return gameAudioActive;
     }
 
     private static void handle(List<AudioPlaybackConfiguration> configs) {
+        boolean hadGameAudio = gameAudioActive;
         boolean hasExternalMedia = false;
         boolean hasGameAudio = false;
 
@@ -90,16 +92,36 @@ public final class ExternalMediaMonitor {
             }
         }
 
+        MusicService service = MusicService.getInstance();
+        boolean musicPlayingNow = isServicePlaying(service);
+
+        if (!hadGameAudio && !hasGameAudio && !hasExternalMedia) {
+            musicWasPlayingBeforeGame = musicPlayingNow;
+        }
+
         gameAudioActive = hasGameAudio;
         externalMediaActive = hasExternalMedia;
 
-        MusicService service = MusicService.getInstance();
         if (service == null) return;
 
         if (hasExternalMedia) {
+            cancelGameGuard();
             cancelPendingResume();
             if (!pausedByExternalMedia) pausedByExternalMedia = service.pauseForExternalMedia();
             return;
+        }
+
+        if (hasGameAudio) {
+            // Si TikowikoMusic jouait juste avant l'ouverture du jeu, on arme une
+            // courte protection. Elle rattrape les jeux qui volent le focus une
+            // fraction de seconde après leur lancement et évite la coupure nette.
+            if (!hadGameAudio && (musicPlayingNow || musicWasPlayingBeforeGame)) {
+                musicWasPlayingBeforeGame = true;
+                startGameGuard();
+            }
+        } else {
+            cancelGameGuard();
+            musicWasPlayingBeforeGame = musicPlayingNow;
         }
 
         if (!pausedByExternalMedia || pendingResume != null) return;
@@ -112,6 +134,47 @@ public final class ExternalMediaMonitor {
             }
         };
         handler.postDelayed(pendingResume, 700L);
+    }
+
+    private static void startGameGuard() {
+        cancelGameGuard();
+        gameGuardAttempt = 0;
+        gameFocusGuard = new Runnable() {
+            @Override public void run() {
+                if (!gameAudioActive || externalMediaActive || !musicWasPlayingBeforeGame || appContext == null) {
+                    cancelGameGuard();
+                    return;
+                }
+
+                MusicService service = MusicService.getInstance();
+                if (service != null && !isServicePlaying(service)) {
+                    try {
+                        Intent resume = new Intent(appContext, MusicService.class)
+                                .setAction(MusicService.ACTION_RESUME);
+                        appContext.startService(resume);
+                    } catch (Exception ignored) {}
+                }
+
+                gameGuardAttempt++;
+                if (gameGuardAttempt >= 7) {
+                    cancelGameGuard();
+                    return;
+                }
+                long delay = gameGuardAttempt < 3 ? 180L : 420L;
+                handler.postDelayed(this, delay);
+            }
+        };
+        handler.postDelayed(gameFocusGuard, 80L);
+    }
+
+    private static boolean isServicePlaying(MusicService service) {
+        if (service == null) return false;
+        try {
+            String state = service.getStateJson();
+            return state != null && state.contains("\"playing\":true");
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static boolean isGameAudioConfiguration(AudioPlaybackConfiguration configuration) {
@@ -143,7 +206,6 @@ public final class ExternalMediaMonitor {
         AudioAttributes attributes = configuration.getAudioAttributes();
         if (attributes == null) return false;
 
-        // Même règle que l'ancienne application : un jeu ne doit pas couper la musique.
         if (attributes.getUsage() == AudioAttributes.USAGE_GAME) return false;
         if (attributes.getUsage() != AudioAttributes.USAGE_MEDIA) return false;
 
@@ -154,8 +216,6 @@ public final class ExternalMediaMonitor {
             return true;
         }
 
-        // Repli prudent quand Android masque l'UID : vidéo/parole oui,
-        // musique/sonification non. Cela protège les jeux mal déclarés.
         int content = attributes.getContentType();
         return content == AudioAttributes.CONTENT_TYPE_MOVIE ||
                 content == AudioAttributes.CONTENT_TYPE_SPEECH;
@@ -222,5 +282,11 @@ public final class ExternalMediaMonitor {
     private static void cancelPendingResume() {
         if (pendingResume != null) handler.removeCallbacks(pendingResume);
         pendingResume = null;
+    }
+
+    private static void cancelGameGuard() {
+        if (gameFocusGuard != null) handler.removeCallbacks(gameFocusGuard);
+        gameFocusGuard = null;
+        gameGuardAttempt = 0;
     }
 }
