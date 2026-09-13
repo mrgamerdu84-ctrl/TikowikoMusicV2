@@ -21,6 +21,9 @@ import java.util.regex.Pattern;
  * - les jeux et notifications ne coupent pas la musique ;
  * - une vraie lecture vidéo/média peut mettre en pause si le mode Focus n'est pas "keep" ;
  * - la reprise est automatique quand le média externe s'arrête.
+ *
+ * Cette version expose aussi l'état audio des jeux au MusicService afin qu'un
+ * jeu qui demande un focus transitoire ne mette plus le lecteur en pause.
  */
 public final class ExternalMediaMonitor {
     private static final Handler handler = new Handler(Looper.getMainLooper());
@@ -28,7 +31,8 @@ public final class ExternalMediaMonitor {
     private static AudioManager audioManager;
     private static AudioManager.AudioPlaybackCallback callback;
     private static boolean pausedByExternalMedia = false;
-    private static boolean externalMediaActive = false;
+    private static volatile boolean externalMediaActive = false;
+    private static volatile boolean gameAudioActive = false;
     private static Runnable pendingResume;
 
     private ExternalMediaMonitor() {}
@@ -59,18 +63,34 @@ public final class ExternalMediaMonitor {
         appContext = null;
         pausedByExternalMedia = false;
         externalMediaActive = false;
+        gameAudioActive = false;
+    }
+
+    public static boolean isExternalMediaActive() {
+        return externalMediaActive;
+    }
+
+    /**
+     * Utilisé par MusicService pour ignorer les pertes de focus provoquées par
+     * les jeux. Certains jeux annoncent USAGE_MEDIA au lieu de USAGE_GAME ; on
+     * les reconnaît alors par leur catégorie Android quand l'UID est visible.
+     */
+    public static boolean isGameAudioActive() {
+        return gameAudioActive;
     }
 
     private static void handle(List<AudioPlaybackConfiguration> configs) {
         boolean hasExternalMedia = false;
+        boolean hasGameAudio = false;
+
         if (configs != null) {
             for (AudioPlaybackConfiguration config : configs) {
-                if (isExternalPrimaryMedia(config)) {
-                    hasExternalMedia = true;
-                    break;
-                }
+                if (isGameAudioConfiguration(config)) hasGameAudio = true;
+                if (isExternalPrimaryMedia(config)) hasExternalMedia = true;
             }
         }
+
+        gameAudioActive = hasGameAudio;
         externalMediaActive = hasExternalMedia;
 
         MusicService service = MusicService.getInstance();
@@ -94,6 +114,30 @@ public final class ExternalMediaMonitor {
         handler.postDelayed(pendingResume, 700L);
     }
 
+    private static boolean isGameAudioConfiguration(AudioPlaybackConfiguration configuration) {
+        if (configuration == null) return false;
+        AudioAttributes attributes = configuration.getAudioAttributes();
+        if (attributes == null) return false;
+
+        int uid = clientUidCompat(configuration);
+        if (uid == Process.myUid()) return false;
+
+        if (attributes.getUsage() == AudioAttributes.USAGE_GAME) return true;
+        if (uid >= 0 && isGameUid(uid)) return true;
+
+        // Certains jeux anciens ou mal déclarés se présentent comme MEDIA sans
+        // UID exploitable. MUSIC/SONIFICATION/UNKNOWN est alors traité comme
+        // audio de jeu pour éviter une coupure brutale. MOVIE/SPEECH reste
+        // réservé aux vidéos et lecteurs comme Netflix.
+        if (uid < 0 && attributes.getUsage() == AudioAttributes.USAGE_MEDIA) {
+            int content = attributes.getContentType();
+            return content == AudioAttributes.CONTENT_TYPE_MUSIC ||
+                    content == AudioAttributes.CONTENT_TYPE_SONIFICATION ||
+                    content == AudioAttributes.CONTENT_TYPE_UNKNOWN;
+        }
+        return false;
+    }
+
     private static boolean isExternalPrimaryMedia(AudioPlaybackConfiguration configuration) {
         if (configuration == null) return false;
         AudioAttributes attributes = configuration.getAudioAttributes();
@@ -110,9 +154,11 @@ public final class ExternalMediaMonitor {
             return true;
         }
 
-        // Repli prudent quand Android masque l'UID : vidéo/parole oui, musique/sonification non.
+        // Repli prudent quand Android masque l'UID : vidéo/parole oui,
+        // musique/sonification non. Cela protège les jeux mal déclarés.
         int content = attributes.getContentType();
-        return content == AudioAttributes.CONTENT_TYPE_MOVIE || content == AudioAttributes.CONTENT_TYPE_SPEECH;
+        return content == AudioAttributes.CONTENT_TYPE_MOVIE ||
+                content == AudioAttributes.CONTENT_TYPE_SPEECH;
     }
 
     private static int clientUidCompat(AudioPlaybackConfiguration configuration) {
@@ -163,7 +209,8 @@ public final class ExternalMediaMonitor {
                     //noinspection deprecation
                     info = pm.getApplicationInfo(packageName, 0);
                 }
-                boolean categoryGame = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && info.category == ApplicationInfo.CATEGORY_GAME;
+                boolean categoryGame = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                        info.category == ApplicationInfo.CATEGORY_GAME;
                 //noinspection deprecation
                 boolean legacyGame = (info.flags & ApplicationInfo.FLAG_IS_GAME) != 0;
                 if (categoryGame || legacyGame) return true;
