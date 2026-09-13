@@ -23,8 +23,8 @@ import java.util.regex.Pattern;
  * - une vraie lecture vidéo/média peut mettre en pause si le mode Focus n'est pas "keep" ;
  * - la reprise est automatique quand le média externe s'arrête.
  *
- * Certains jeux demandent un focus audio transitoire ou se déclarent en MEDIA.
- * On les détecte séparément et on protège la lecture pendant leur démarrage.
+ * Certains jeux demandent le focus audio plusieurs fois ou se déclarent en MEDIA.
+ * On les détecte séparément et on protège la lecture pendant toute leur phase de démarrage.
  */
 public final class ExternalMediaMonitor {
     private static final Handler handler = new Handler(Looper.getMainLooper());
@@ -112,12 +112,16 @@ public final class ExternalMediaMonitor {
         }
 
         if (hasGameAudio) {
-            // Si TikowikoMusic jouait juste avant l'ouverture du jeu, on arme une
-            // courte protection. Elle rattrape les jeux qui volent le focus une
-            // fraction de seconde après leur lancement et évite la coupure nette.
-            if (!hadGameAudio && (musicPlayingNow || musicWasPlayingBeforeGame)) {
+            if (!hadGameAudio && musicPlayingNow) {
                 musicWasPlayingBeforeGame = true;
-                startGameGuard();
+            }
+
+            // Tant qu'un jeu est détecté et que la musique jouait avant son
+            // ouverture, on garde un garde-fou actif. Certains jeux volent le
+            // focus plusieurs secondes après l'écran de lancement.
+            if (musicWasPlayingBeforeGame && (!musicPlayingNow || gameFocusGuard == null)) {
+                if (!musicPlayingNow) forceResumeForGame();
+                if (gameFocusGuard == null) startGameGuard();
             }
         } else {
             cancelGameGuard();
@@ -148,23 +152,33 @@ public final class ExternalMediaMonitor {
 
                 MusicService service = MusicService.getInstance();
                 if (service != null && !isServicePlaying(service)) {
-                    try {
-                        Intent resume = new Intent(appContext, MusicService.class)
-                                .setAction(MusicService.ACTION_RESUME);
-                        appContext.startService(resume);
-                    } catch (Exception ignored) {}
+                    forceResumeForGame();
                 }
 
+                // Protection longue : les jeux qui redemandent le focus après
+                // leur pub, écran de chargement ou changement de scène ne doivent
+                // pas tuer définitivement la musique.
                 gameGuardAttempt++;
-                if (gameGuardAttempt >= 7) {
+                if (gameGuardAttempt >= 60) {
                     cancelGameGuard();
                     return;
                 }
-                long delay = gameGuardAttempt < 3 ? 180L : 420L;
+                long delay = gameGuardAttempt < 8 ? 180L : 600L;
                 handler.postDelayed(this, delay);
             }
         };
-        handler.postDelayed(gameFocusGuard, 80L);
+        handler.postDelayed(gameFocusGuard, 60L);
+    }
+
+    private static void forceResumeForGame() {
+        Context context = appContext;
+        if (context == null || externalMediaActive || !gameAudioActive || !musicWasPlayingBeforeGame) return;
+        try {
+            Intent resume = new Intent(context, MusicService.class)
+                    .setAction(MusicService.ACTION_RESUME);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(resume);
+            else context.startService(resume);
+        } catch (Exception ignored) {}
     }
 
     private static boolean isServicePlaying(MusicService service) {
