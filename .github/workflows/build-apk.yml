@@ -79,6 +79,9 @@ jobs:
           cp app/src/main/assets/www/splash.jpg app/src/main/res/drawable/splash.jpg
           cp android-res/splash_screen.xml app/src/main/res/drawable/splash_screen.xml
 
+      - name: Apply Tikowiko media notification theme
+        run: python3 scripts/patch_media_notification.py
+
       - name: Set up Java 17
         uses: actions/setup-java@v5
         with:
