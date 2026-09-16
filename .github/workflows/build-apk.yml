@@ -84,6 +84,9 @@ jobs:
       - name: Apply Tikowiko media notification theme
         run: python3 scripts/patch_media_notification.py
 
+      - name: Apply game crash audio recovery
+        run: python3 scripts/patch_game_crash_recovery.py
+
       - name: Set up Java 17
         uses: actions/setup-java@v5
         with:
