@@ -40,6 +40,7 @@ jobs:
           cp web/enhancements.css app/src/main/assets/www/enhancements.css
           cp web/parallel-media.js app/src/main/assets/www/parallel-media.js
           cp web/library-playlists.js app/src/main/assets/www/library-playlists.js
+          cp web/playlist-continuation.js app/src/main/assets/www/playlist-continuation.js
           cp web/library-playlists.css app/src/main/assets/www/library-playlists.css
           cp web/folder-strict.js app/src/main/assets/www/folder-strict.js
           cp web/tikobot.js app/src/main/assets/www/tikobot.js
@@ -64,6 +65,7 @@ jobs:
               '<script src="enhancements.js"></script>',
               '<script src="parallel-media.js"></script>',
               '<script src="library-playlists.js"></script>',
+              '<script src="playlist-continuation.js"></script>',
               '<script src="folder-strict.js"></script>',
               '<script src="tikobot.js"></script>',
               '<script src="tikobot-visual.js"></script>',
